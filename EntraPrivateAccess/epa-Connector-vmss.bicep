@@ -27,7 +27,7 @@ param domainJoinUserSecretName string = 'domainJoin-username'
 param domainJoinPasswordSecretName string = 'domainJoin-password'
 
 @description('URI to the bootstrap PowerShell script (e.g., blob SAS URL)')
-param bootstrapScriptUri string
+param bootstrapScriptUri string = 'https://raw.githubusercontent.com/ImperatorRuscal/AzureTools/refs/heads/main/EntraPrivateAccess/epa-connector-bootstrap.ps1'
 
 @description('Tenant ID (GUID) where you register the connector')
 param tenantId string
