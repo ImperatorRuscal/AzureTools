@@ -1,4 +1,4 @@
-﻿[CmdletBinding()]
+[CmdletBinding()]
 param(
   [string] $KeyVaultName,                       # Optional override; else from tag epa_KeyVault_Name
   [string] $KeyVaultADUserSecretName,           # Optional override; else tag epa_KeyVault_ADJoinUser_SecretName
@@ -13,7 +13,7 @@ $IsAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIde
 if (-not $IsAdmin) { Write-Error "Run elevated (Administrator)."; exit 1 }
 
 $ErrorActionPreference = 'Stop'
-try{
+#try{
 
     #region "Statics"
 
@@ -65,8 +65,61 @@ try{
             Write-Stamp "Ensuring availability of module $name"
             if(-not $psGallery)
             {
+		Write-Stamp 'Setting up PS Gallery'
+
+		$pmMin = [Version]'1.4.8.1'
+		$pgMin = [Version]'2.2.5'
+
+		$pm    = Get-Module PackageManagement -ListAvailable | Sort-Object Version -Descending | Select-Object -First 1
+		$pg    = Get-Module PowerShellGet      -ListAvailable | Sort-Object Version -Descending | Select-Object -First 1
+
+        $nuget = get-packageprovider -name NuGet -ErrorAction SilentlyContinue
+        if((-not $nuget) -or ($nuget.version -lt [version]"2.8.5.201")){
+            Write-Stamp 'Installing NuGet'
+			## Doesn't work unattended
+            ## Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force -ForceBootstrap -Confirm:$False -Scope AllUsers | Out-Null
+            $nugetVer     = '2.8.5.208'
+            $dllName      = 'Microsoft.PackageManagement.NuGetProvider.dll'
+            $providerRoot = Join-Path $env:ProgramFiles 'PackageManagement\ProviderAssemblies\nuget'
+            $providerDir  = Join-Path $providerRoot   $nugetVer
+            New-Item -ItemType Directory -Force -Path $providerDir | Out-Null
+
+            # Official CDN path (mirrors the prompt’s URL). If your enterprise blocks this, host it internally and change the URL.
+            $url  = 'https://onegetcdn.azureedge.net/providers/Microsoft.PackageManagement.NuGetProvider-2.8.5.208.dll'
+            $dest = Join-Path $providerDir $dllName
+
+            Invoke-WebRequest -Uri $url -OutFile $dest -UseBasicParsing
+
+            # Also copy to the user cache location to satisfy older loaders
+            $userCacheDir = Join-Path $env:LOCALAPPDATA 'PackageManagement\ProviderAssemblies\nuget\' + $nugetVer
+            New-Item -ItemType Directory -Force -Path $userCacheDir | Out-Null
+            Copy-Item $dest (Join-Path $userCacheDir $dllName) -Force
+
+		}
+
+		if (-not $pm -or $pm.Version -lt $pmMin) {
+			    Write-Stamp 'Installing PackageManagement'
+		    	Install-Module PackageManagement -MinimumVersion $pmMin -Force -AllowClobber -Confirm:$false -Scope AllUsers
+		}
+		if (-not $pg -or $pg.Version -lt $pgMin) {
+			Write-Stamp 'Installing PowerShellGet'
+			Install-Module PowerShellGet -MinimumVersion $pgMin -Force -AllowClobber -Confirm:$false -Scope AllUsers
+		}
+
+		try {
+		    if ((Get-PSRepository -Name PSGallery -ErrorAction SilentlyContinue).InstallationPolicy -ne 'Trusted') {
+			    Write-Stamp 'Trusting the repo'
+		        Set-PSRepository -Name PSGallery -InstallationPolicy Trusted
+		    }
+		} catch {}
+
+		# IMPORTANT: reload the updated modules in the current process
+		Remove-Module PackageManagement,PowerShellGet -ErrorAction SilentlyContinue
+		Import-Module  PackageManagement
+		Import-Module  PowerShellGet
+
                 $nuget = get-packageprovider -name NuGet -ErrorAction SilentlyContinue
-                if((-not $nuget) -or ($nuget.version -lt [version]"2.8.5.201")){Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force | Out-Null}
+                if((-not $nuget) -or ($nuget.version -lt [version]"2.8.5.201")){Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force -ForceBootstrap -Confirm:$False | Out-Null}
             }
             if (-not $psGallery) {$psGallery = Get-PSRepository -Name PSGallery -ErrorAction SilentlyContinue}
             if (-not $psGallery) { Register-PSRepository -Default | Out-Null }
@@ -247,7 +300,7 @@ try{
             $auth = Get-AuthenticodeSignature -FilePath $installerPath
             if ($auth.Status -ne 'Valid') { throw "Installer signature invalid: $($auth.Status)" } else { Write-Stamp 'Installer signature verified' }
 
-            $installArgs = 'REGISTERCONNECTOR="false" REBOOT=ReallySuppress /qn'
+            $installArgs = 'REGISTERCONNECTOR="false" REBOOT=ReallySuppress /q'
             Write-Stamp "Installing connector (quiet, no reboot) -> $installerPath"
             $proc = Start-Process -FilePath $installerPath -ArgumentList $installArgs -PassThru -Wait
             if ($proc.ExitCode -ne 0) { throw "Connector installer exited with code $($proc.ExitCode)" }
@@ -286,8 +339,11 @@ try{
         Disable-ScheduledTask -TaskName $bootStrapTaskName -TaskPath '\' -ErrorAction SilentlyContinue | Out-Null
 
     #endregion
-}
-finally
-{
+
+#}catch{
+#    Write-Stamp 'Ejecting due to uncaught failure' 'ERR '
+#    Write-Host $_.Exception.ToString()
+#finally
+#{
     Stop-Transcript -ErrorAction SilentlyContinue | Out-Null
-}
+#}
