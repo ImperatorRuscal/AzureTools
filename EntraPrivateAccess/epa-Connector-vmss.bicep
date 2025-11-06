@@ -1,23 +1,24 @@
 @description('Name of the VM Scale Set')
 param vmssName string = 'vmss-epac'
 
+@description('SKU of the Windows version to install/image from')
+param winImageSku string = '2025-datacenter-azure-edition-core' // adjust if your region exposes a variant
+
 @description('Windows local administrator username')
 param adminUsername string = 'azAdministrator'
 
-@description('Name of the Key Vault that holds the admin password and other secrets')
-param keyVaultName string
-
-@description('Secret name in Key Vault for the local administrator password')
-param adminPasswordSecretName string
+@description('The local admin account password')
+@secure()
+param adminPassword string
 
 @description('Existing UAMI NAME (in the same resource group as this deployment)')
 param uamiName string ='uami-entraprivateconnector'
 
-@description('Existing Virtual Network NAME (in a different resource group)')
-param vnetName string
-
 @description('Resource group NAME that contains the vNet')
 param vnetResourceGroupName string
+
+@description('Existing Virtual Network NAME (in a different resource group)')
+param vnetName string
 
 @description('Subnet NAME within the vNet')
 param subnetName string
@@ -26,43 +27,43 @@ param subnetName string
 param vmSize string = 'Standard_B2ms'
 
 @description('Custom script URL to run during initialization')
-param initScriptUrl string
+param initScriptUrl string = 'https://raw.githubusercontent.com/ImperatorRuscal/AzureTools/main/EntraPrivateAccess/epa-bootstrapper.ps1'
 
 @description('Command to execute after the file is downloaded')
-param initCommandToExecute string = 'powershell -ExecutionPolicy Bypass -File .\\init.ps1'
+param initCommandToExecute string = 'powershell -ExecutionPolicy Bypass -File .\\epa-bootstrapper.ps1'
 
-@description('Resource group NAME that contains the Key Vault')
-param keyVaultResourceGroupName string
+@description('Name of the Key Vault that holds the admin password and other secrets')
+param keyVaultName string
 
-@description('Tags: epa_KeyVault_Name')
-param tag_epa_KeyVault_Name string
+@description('Tags: epa_AD_FQDN')
+param tag_epa_AD_FQDN string
+
+@description('Tags: epa_AD_OU')
+param tag_epa_AD_OU string = 'CN=Computers,DC=domain,DC=local'
 
 @description('Tags: epa_KeyVault_ADJoinUser_SecretName')
-param tag_epa_KeyVault_ADJoinUser_SecretName string
+param tag_epa_KeyVault_ADJoinUser_SecretName string = 'domainJoin-username'
 
 @description('Tags: epa_KeyVault_ADJoinPassword_SecretName')
-param tag_epa_KeyVault_ADJoinPassword_SecretName string
+param tag_epa_KeyVault_ADJoinPassword_SecretName string = 'domainJoin-password'
 
 @description('Tags: epa_KeyVault_RegistrationUser_SecretName')
-param tag_epa_KeyVault_RegistrationUser_SecretName string
+param tag_epa_KeyVault_RegistrationUser_SecretName string = 'epaReg-username'
 
 @description('Tags: epa_KeyVault_RegistrationPassword_SecretName')
-param tag_epa_KeyVault_RegistrationPassword_SecretName string
+param tag_epa_KeyVault_RegistrationPassword_SecretName string = 'epaReg-password'
+
 
 // ---- Image definition (Windows Server 2025 Datacenter Azure Edition Core) ----
 var imagePublisher = 'MicrosoftWindowsServer'
 var imageOffer     = 'WindowsServer'
-var imageSku       = '2025-datacenter-azure-edition-core' // adjust if your region exposes a variant
+var imageSku       = winImageSku
 var imageVersion   = 'latest'
+
 
 // ------- Existing resources -------
 resource uami 'Microsoft.ManagedIdentity/userAssignedIdentities@2018-11-30' existing = {
   name: uamiName
-}
-
-resource kv 'Microsoft.KeyVault/vaults@2023-02-01' existing = {
-  scope: resourceGroup(keyVaultResourceGroupName)
-  name: keyVaultName
 }
 
 // vNet/Subnet exist in a different resource group
@@ -76,12 +77,6 @@ resource subnetRes 'Microsoft.Network/virtualNetworks/subnets@2023-11-01' existi
   name: subnetName
 }
 
-// Pull the admin password securely from Key Vault at deployment time
-// (Requires the vault to allow template deployment / access policy for the deployer)
-var adminPasswordRef = reference(
-  format('{0}/secrets/{1}', kv.id, adminPasswordSecretName),
-  '2021-10-01'
-)
 
 // ----------------------- VM Scale Set (Flexible, Rolling) -----------------------
 resource vmss 'Microsoft.Compute/virtualMachineScaleSets@2024-07-01' = {
@@ -99,14 +94,17 @@ resource vmss 'Microsoft.Compute/virtualMachineScaleSets@2024-07-01' = {
     }
   }
   tags: {
-    epa_KeyVault_Name: tag_epa_KeyVault_Name
+    epa_KeyVault_Name: keyVaultName
     epa_KeyVault_ADJoinUser_SecretName: tag_epa_KeyVault_ADJoinUser_SecretName
     epa_KeyVault_ADJoinPassword_SecretName: tag_epa_KeyVault_ADJoinPassword_SecretName
+	epa_AD_FQDN : tag_epa_AD_FQDN
+	epa_AD_OU : tag_epa_AD_OU
     epa_KeyVault_RegistrationUser_SecretName: tag_epa_KeyVault_RegistrationUser_SecretName
     epa_KeyVault_RegistrationPassword_SecretName: tag_epa_KeyVault_RegistrationPassword_SecretName
   }
   properties: {
     orchestrationMode: 'Flexible'
+	platformFaultDomainCount: 1 
     upgradePolicy: {
       mode: 'Rolling'
       rollingUpgradePolicy: {
@@ -115,12 +113,15 @@ resource vmss 'Microsoft.Compute/virtualMachineScaleSets@2024-07-01' = {
         maxUnhealthyInstancePercent: 20
         maxUnhealthyUpgradedInstancePercent: 20
         pauseTimeBetweenBatches: 'PT0S'
-        enableCrossZoneUpgrade: false
+        // enableCrossZoneUpgrade: false
         prioritizeUnhealthyInstances: true
       }
     }
-    platformFaultDomainCount: 1
-
+	scaleInPolicy: {
+		rules: [
+			'OldestVM'
+		]
+	}
     virtualMachineProfile: {
       securityProfile: {
         securityType: 'TrustedLaunch'
@@ -147,16 +148,18 @@ resource vmss 'Microsoft.Compute/virtualMachineScaleSets@2024-07-01' = {
       osProfile: {
         computerNamePrefix: 'epac-'
         adminUsername: adminUsername
-        adminPassword: adminPasswordRef.value
+        adminPassword: adminPassword  // adminPasswordRef.value
         windowsConfiguration: {
           provisionVMAgent: true
           enableAutomaticUpdates: true
           patchSettings: {
-            patchMode: 'AutomaticByOS'
+            patchMode: 'AutomaticByPlatform'
+			enableHotpatching: true
           }
         }
       }
       networkProfile: {
+		networkApiVersion: '2022-11-01'
         networkInterfaceConfigurations: [
           {
             name: 'nic-epac'
@@ -178,24 +181,52 @@ resource vmss 'Microsoft.Compute/virtualMachineScaleSets@2024-07-01' = {
           }
         ]
       }
-      extensionProfile: {
-        extensions: [
-          {
-            name: 'customScript'
-            properties: {
-              publisher: 'Microsoft.Compute'
-              type: 'CustomScriptExtension'
-              typeHandlerVersion: '1.10'
-              autoUpgradeMinorVersion: true
-              settings: {
-                fileUris: [
-                  initScriptUrl
-                ]
-                commandToExecute: initCommandToExecute
-              }
-            }
-          }
+	extensionProfile: {
+		extensions: [
+			{
+				name: 'customScript'
+				properties: {
+					publisher: 'Microsoft.Compute'
+					type: 'CustomScriptExtension'
+					typeHandlerVersion: '1.10'
+					autoUpgradeMinorVersion: true
+					settings: {
+						fileUris: [
+							initScriptUrl
+						]
+						commandToExecute: initCommandToExecute
+					}
+				}
+			},{
+				name: 'appHealth'
+				properties: {
+					publisher: 'Microsoft.ManagedServices'
+					type: 'ApplicationHealthWindows'
+					typeHandlerVersion: '2.0'              // Rich Health States (use 1.0 for Binary if you prefer)
+					autoUpgradeMinorVersion: true
+					// If your custom script must run before health is evaluated, keep this dependency:
+					provisionAfterExtensions: [ 'customScript' ]
+					settings: {
+						protocol: 'tcp'                      // tcp | http | https
+						port: 5985                           // WinRM; simple built-in TCP listener
+						// Optional for v2.0 (rich): give the app time before first probe counts
+						gracePeriod: 600                     // seconds
+						// For http/https you would add: requestPath: "/healthz"
+					}
+				}
+			}
         ]
+      }
+	  diagnosticsProfile: {
+		bootDiagnostics: {
+			enabled: true
+		}
+	  }
+	  scheduledEventsProfile: {
+        terminateNotificationProfile: {
+          enable: true
+          notBeforeTimeout: 'PT5M'
+        }
       }
     }
   }
@@ -215,7 +246,7 @@ resource autoscale 'Microsoft.Insights/autoscalesettings@2022-10-01' = {
         capacity: {
           minimum: '1'
           maximum: '10'
-          default: '1'
+          default: '2'
         }
         rules: [
           // Scale OUT: CPU > 80% for 10 minutes
@@ -229,7 +260,7 @@ resource autoscale 'Microsoft.Insights/autoscalesettings@2022-10-01' = {
               timeWindow: 'PT10M'
               timeAggregation: 'Average'
               operator: 'GreaterThan'
-              threshold: 80
+              threshold: 70
               dividePerInstance: false
             }
             scaleAction: {
@@ -250,7 +281,7 @@ resource autoscale 'Microsoft.Insights/autoscalesettings@2022-10-01' = {
               timeWindow: 'PT10M'
               timeAggregation: 'Average'
               operator: 'LessThanOrEqual'
-              threshold: 60
+              threshold: 50
               dividePerInstance: false
             }
             scaleAction: {
@@ -264,6 +295,7 @@ resource autoscale 'Microsoft.Insights/autoscalesettings@2022-10-01' = {
       }
     ]
   }
+  dependsOn: [ vmss ]
 }
 
 // ----------------------- Outputs -----------------------
