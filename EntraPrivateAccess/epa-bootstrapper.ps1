@@ -101,7 +101,6 @@ public class TrustAllCertsPolicy : ICertificatePolicy {
             [System.Net.ServicePointManager]::CertificatePolicy = New-Object TrustAllCertsPolicy
 			Write-Stamp ([System.Net.ServicePointManager]::CertificatePolicy)
             Write-Stamp 'Cert trust updated'
-} catch {}
 
             Invoke-WithRetry { Invoke-WebRequest -Uri $url -OutFile $dest -UseBasicParsing }
             Write-Stamp 'Nuget downloaded'
@@ -109,6 +108,7 @@ public class TrustAllCertsPolicy : ICertificatePolicy {
             $userCacheDir = Join-Path $env:LOCALAPPDATA "PackageManagement\ProviderAssemblies\nuget\$nugetVer"
             New-Item -ItemType Directory -Force -Path $userCacheDir | Out-Null
             Copy-Item $dest (Join-Path $userCacheDir $dllName) -Force
+} catch {}
 
 		}
 
@@ -362,4 +362,5 @@ public class TrustAllCertsPolicy : ICertificatePolicy {
 #{
     Stop-Transcript -ErrorAction SilentlyContinue | Out-Null
 #}
+
 
