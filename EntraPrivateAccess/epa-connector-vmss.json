@@ -1,0 +1,373 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+  "contentVersion": "1.0.0.0",
+  "metadata": {
+    "_generator": {
+      "name": "bicep",
+      "version": "0.38.33.27573",
+      "templateHash": "8988912056578620471"
+    }
+  },
+  "parameters": {
+    "vmssName": {
+      "type": "string",
+      "defaultValue": "vmss-epac",
+      "metadata": {
+        "description": "Name of the VM Scale Set"
+      }
+    },
+    "winImageSku": {
+      "type": "string",
+      "defaultValue": "2025-datacenter-azure-edition-core",
+      "metadata": {
+        "description": "SKU of the Windows version to install/image from"
+      }
+    },
+    "adminUsername": {
+      "type": "string",
+      "defaultValue": "azAdministrator",
+      "metadata": {
+        "description": "Windows local administrator username"
+      }
+    },
+    "adminPassword": {
+      "type": "securestring",
+      "metadata": {
+        "description": "The local admin account password"
+      }
+    },
+    "uamiName": {
+      "type": "string",
+      "defaultValue": "uami-entraprivateconnector",
+      "metadata": {
+        "description": "Existing UAMI NAME (in the same resource group as this deployment)"
+      }
+    },
+    "vnetResourceGroupName": {
+      "type": "string",
+      "metadata": {
+        "description": "Resource group NAME that contains the vNet"
+      }
+    },
+    "vnetName": {
+      "type": "string",
+      "metadata": {
+        "description": "Existing Virtual Network NAME (in a different resource group)"
+      }
+    },
+    "subnetName": {
+      "type": "string",
+      "metadata": {
+        "description": "Subnet NAME within the vNet"
+      }
+    },
+    "vmSize": {
+      "type": "string",
+      "defaultValue": "Standard_B2ms",
+      "metadata": {
+        "description": "VM size for instances"
+      }
+    },
+    "initScriptUrl": {
+      "type": "string",
+      "defaultValue": "https://raw.githubusercontent.com/ImperatorRuscal/AzureTools/main/EntraPrivateAccess/epa-bootstrapper.ps1",
+      "metadata": {
+        "description": "Custom script URL to run during initialization"
+      }
+    },
+    "initCommandToExecute": {
+      "type": "string",
+      "defaultValue": "powershell -ExecutionPolicy Bypass -File .\\epa-bootstrapper.ps1",
+      "metadata": {
+        "description": "Command to execute after the file is downloaded"
+      }
+    },
+    "keyVaultName": {
+      "type": "string",
+      "metadata": {
+        "description": "Name of the Key Vault that holds the admin password and other secrets"
+      }
+    },
+    "tag_epa_AD_FQDN": {
+      "type": "string",
+      "metadata": {
+        "description": "Tags: epa_AD_FQDN"
+      }
+    },
+    "tag_epa_AD_OU": {
+      "type": "string",
+      "defaultValue": "CN=Computers,DC=domain,DC=local",
+      "metadata": {
+        "description": "Tags: epa_AD_OU"
+      }
+    },
+    "tag_epa_KeyVault_ADJoinUser_SecretName": {
+      "type": "string",
+      "defaultValue": "domainJoin-username",
+      "metadata": {
+        "description": "Tags: epa_KeyVault_ADJoinUser_SecretName"
+      }
+    },
+    "tag_epa_KeyVault_ADJoinPassword_SecretName": {
+      "type": "string",
+      "defaultValue": "domainJoin-password",
+      "metadata": {
+        "description": "Tags: epa_KeyVault_ADJoinPassword_SecretName"
+      }
+    },
+    "tag_epa_KeyVault_RegistrationUser_SecretName": {
+      "type": "string",
+      "defaultValue": "epaReg-username",
+      "metadata": {
+        "description": "Tags: epa_KeyVault_RegistrationUser_SecretName"
+      }
+    },
+    "tag_epa_KeyVault_RegistrationPassword_SecretName": {
+      "type": "string",
+      "defaultValue": "epaReg-password",
+      "metadata": {
+        "description": "Tags: epa_KeyVault_RegistrationPassword_SecretName"
+      }
+    }
+  },
+  "variables": {
+    "imagePublisher": "MicrosoftWindowsServer",
+    "imageOffer": "WindowsServer",
+    "imageSku": "[parameters('winImageSku')]",
+    "imageVersion": "latest"
+  },
+  "resources": [
+    {
+      "type": "Microsoft.Compute/virtualMachineScaleSets",
+      "apiVersion": "2024-07-01",
+      "name": "[parameters('vmssName')]",
+      "location": "[resourceGroup().location]",
+      "sku": {
+        "name": "[parameters('vmSize')]",
+        "tier": "Standard",
+        "capacity": 1
+      },
+      "identity": {
+        "type": "UserAssigned",
+        "userAssignedIdentities": {
+          "[format('{0}', resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', parameters('uamiName')))]": {}
+        }
+      },
+      "tags": {
+        "epa_KeyVault_Name": "[parameters('keyVaultName')]",
+        "epa_KeyVault_ADJoinUser_SecretName": "[parameters('tag_epa_KeyVault_ADJoinUser_SecretName')]",
+        "epa_KeyVault_ADJoinPassword_SecretName": "[parameters('tag_epa_KeyVault_ADJoinPassword_SecretName')]",
+        "epa_AD_FQDN": "[parameters('tag_epa_AD_FQDN')]",
+        "epa_AD_OU": "[parameters('tag_epa_AD_OU')]",
+        "epa_KeyVault_RegistrationUser_SecretName": "[parameters('tag_epa_KeyVault_RegistrationUser_SecretName')]",
+        "epa_KeyVault_RegistrationPassword_SecretName": "[parameters('tag_epa_KeyVault_RegistrationPassword_SecretName')]"
+      },
+      "properties": {
+        "orchestrationMode": "Flexible",
+        "platformFaultDomainCount": 1,
+        "upgradePolicy": {
+          "mode": "Rolling",
+          "rollingUpgradePolicy": {
+            "maxBatchInstancePercent": 20,
+            "maxUnhealthyInstancePercent": 20,
+            "maxUnhealthyUpgradedInstancePercent": 20,
+            "pauseTimeBetweenBatches": "PT0S",
+            "prioritizeUnhealthyInstances": true
+          }
+        },
+        "scaleInPolicy": {
+          "rules": [
+            "OldestVM"
+          ]
+        },
+        "virtualMachineProfile": {
+          "securityProfile": {
+            "securityType": "TrustedLaunch",
+            "uefiSettings": {
+              "secureBootEnabled": true,
+              "vTpmEnabled": true
+            }
+          },
+          "storageProfile": {
+            "imageReference": {
+              "publisher": "[variables('imagePublisher')]",
+              "offer": "[variables('imageOffer')]",
+              "sku": "[variables('imageSku')]",
+              "version": "[variables('imageVersion')]"
+            },
+            "osDisk": {
+              "createOption": "FromImage",
+              "caching": "ReadWrite",
+              "managedDisk": {
+                "storageAccountType": "Premium_LRS"
+              }
+            }
+          },
+          "osProfile": {
+            "computerNamePrefix": "epac-",
+            "adminUsername": "[parameters('adminUsername')]",
+            "adminPassword": "[parameters('adminPassword')]",
+            "windowsConfiguration": {
+              "provisionVMAgent": true,
+              "enableAutomaticUpdates": true,
+              "patchSettings": {
+                "patchMode": "AutomaticByPlatform",
+                "enableHotpatching": true
+              }
+            }
+          },
+          "networkProfile": {
+            "networkApiVersion": "2022-11-01",
+            "networkInterfaceConfigurations": [
+              {
+                "name": "nic-epac",
+                "properties": {
+                  "primary": true,
+                  "deleteOption": "Delete",
+                  "ipConfigurations": [
+                    {
+                      "name": "ipconfig-epac",
+                      "properties": {
+                        "primary": true,
+                        "subnet": {
+                          "id": "[extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('vnetResourceGroupName')), 'Microsoft.Network/virtualNetworks/subnets', parameters('vnetName'), parameters('subnetName'))]"
+                        }
+                      }
+                    }
+                  ]
+                }
+              }
+            ]
+          },
+          "extensionProfile": {
+            "extensions": [
+              {
+                "name": "customScript",
+                "properties": {
+                  "publisher": "Microsoft.Compute",
+                  "type": "CustomScriptExtension",
+                  "typeHandlerVersion": "1.10",
+                  "autoUpgradeMinorVersion": true,
+                  "settings": {
+                    "fileUris": [
+                      "[parameters('initScriptUrl')]"
+                    ],
+                    "commandToExecute": "[parameters('initCommandToExecute')]"
+                  }
+                }
+              },
+              {
+                "name": "appHealth",
+                "properties": {
+                  "publisher": "Microsoft.ManagedServices",
+                  "type": "ApplicationHealthWindows",
+                  "typeHandlerVersion": "2.0",
+                  "autoUpgradeMinorVersion": true,
+                  "provisionAfterExtensions": [
+                    "customScript"
+                  ],
+                  "settings": {
+                    "protocol": "tcp",
+                    "port": 5985,
+                    "gracePeriod": 600
+                  }
+                }
+              }
+            ]
+          },
+          "diagnosticsProfile": {
+            "bootDiagnostics": {
+              "enabled": true
+            }
+          },
+          "scheduledEventsProfile": {
+            "terminateNotificationProfile": {
+              "enable": true,
+              "notBeforeTimeout": "PT5M"
+            }
+          }
+        }
+      }
+    },
+    {
+      "type": "Microsoft.Insights/autoscalesettings",
+      "apiVersion": "2022-10-01",
+      "name": "[format('{0}-autoscale', parameters('vmssName'))]",
+      "location": "[resourceGroup().location]",
+      "properties": {
+        "name": "[format('{0}-autoscale', parameters('vmssName'))]",
+        "enabled": true,
+        "targetResourceUri": "[resourceId('Microsoft.Compute/virtualMachineScaleSets', parameters('vmssName'))]",
+        "profiles": [
+          {
+            "name": "cpu-based",
+            "capacity": {
+              "minimum": "1",
+              "maximum": "10",
+              "default": "2"
+            },
+            "rules": [
+              {
+                "metricTrigger": {
+                  "metricName": "Percentage CPU",
+                  "metricNamespace": "Microsoft.Compute/virtualMachineScaleSets",
+                  "metricResourceUri": "[resourceId('Microsoft.Compute/virtualMachineScaleSets', parameters('vmssName'))]",
+                  "timeGrain": "PT1M",
+                  "statistic": "Average",
+                  "timeWindow": "PT10M",
+                  "timeAggregation": "Average",
+                  "operator": "GreaterThan",
+                  "threshold": 70,
+                  "dividePerInstance": false
+                },
+                "scaleAction": {
+                  "direction": "Increase",
+                  "type": "ChangeCount",
+                  "value": "1",
+                  "cooldown": "PT5M"
+                }
+              },
+              {
+                "metricTrigger": {
+                  "metricName": "Percentage CPU",
+                  "metricNamespace": "Microsoft.Compute/virtualMachineScaleSets",
+                  "metricResourceUri": "[resourceId('Microsoft.Compute/virtualMachineScaleSets', parameters('vmssName'))]",
+                  "timeGrain": "PT1M",
+                  "statistic": "Average",
+                  "timeWindow": "PT10M",
+                  "timeAggregation": "Average",
+                  "operator": "LessThanOrEqual",
+                  "threshold": 50,
+                  "dividePerInstance": false
+                },
+                "scaleAction": {
+                  "direction": "Decrease",
+                  "type": "ChangeCount",
+                  "value": "1",
+                  "cooldown": "PT5M"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.Compute/virtualMachineScaleSets', parameters('vmssName'))]"
+      ]
+    }
+  ],
+  "outputs": {
+    "vmssId": {
+      "type": "string",
+      "value": "[resourceId('Microsoft.Compute/virtualMachineScaleSets', parameters('vmssName'))]"
+    },
+    "uamiResourceId": {
+      "type": "string",
+      "value": "[resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', parameters('uamiName'))]"
+    },
+    "subnetId": {
+      "type": "string",
+      "value": "[extensionResourceId(format('/subscriptions/{0}/resourceGroups/{1}', subscription().subscriptionId, parameters('vnetResourceGroupName')), 'Microsoft.Network/virtualNetworks/subnets', parameters('vnetName'), parameters('subnetName'))]"
+    }
+  }
+}
