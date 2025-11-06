@@ -87,7 +87,7 @@ $ErrorActionPreference = 'Stop'
             # Official CDN path (mirrors the prompt’s URL). If your enterprise blocks this, host it internally and change the URL.
             $url  = 'https://onegetcdn.azureedge.net/providers/Microsoft.PackageManagement.NuGetProvider-2.8.5.208.dll'
             $dest = Join-Path $providerDir $dllName
-
+try {
             Write-Stamp 'Looking at Cert Trust'
             Write-Stamp ([System.Net.ServicePointManager]::CertificatePolicy)
 add-type @"
@@ -99,7 +99,9 @@ public class TrustAllCertsPolicy : ICertificatePolicy {
 }
 "@
             [System.Net.ServicePointManager]::CertificatePolicy = New-Object TrustAllCertsPolicy
+			Write-Stamp ([System.Net.ServicePointManager]::CertificatePolicy)
             Write-Stamp 'Cert trust updated'
+} catch {}
 
             Invoke-WithRetry { Invoke-WebRequest -Uri $url -OutFile $dest -UseBasicParsing }
             Write-Stamp 'Nuget downloaded'
@@ -360,3 +362,4 @@ public class TrustAllCertsPolicy : ICertificatePolicy {
 #{
     Stop-Transcript -ErrorAction SilentlyContinue | Out-Null
 #}
+
