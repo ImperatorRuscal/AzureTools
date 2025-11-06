@@ -73,7 +73,7 @@ $ErrorActionPreference = 'Stop'
 		$pm    = Get-Module PackageManagement -ListAvailable | Sort-Object Version -Descending | Select-Object -First 1
 		$pg    = Get-Module PowerShellGet      -ListAvailable | Sort-Object Version -Descending | Select-Object -First 1
 
-        $nuget = get-packageprovider -name NuGet -ErrorAction SilentlyContinue
+        #$nuget = get-packageprovider -name NuGet -ErrorAction SilentlyContinue
         if((-not $nuget) -or ($nuget.version -lt [version]"2.8.5.201")){
             Write-Stamp 'Installing NuGet'
 			## Doesn't work unattended
@@ -88,10 +88,23 @@ $ErrorActionPreference = 'Stop'
             $url  = 'https://onegetcdn.azureedge.net/providers/Microsoft.PackageManagement.NuGetProvider-2.8.5.208.dll'
             $dest = Join-Path $providerDir $dllName
 
-            Invoke-WebRequest -Uri $url -OutFile $dest -UseBasicParsing
+            Write-Stamp 'Looking at Cert Trust'
+            Write-Stamp ([System.Net.ServicePointManager]::CertificatePolicy)
+add-type @"
+using System.Net;
+using System.Security.Cryptography.X509Certificates;
+public class TrustAllCertsPolicy : ICertificatePolicy {
+    public bool CheckValidationResult(ServicePoint srvPoint, X509Certificate certificate,
+                                      WebRequest request, int certificateProblem) { return true; }
+}
+"@
+            [System.Net.ServicePointManager]::CertificatePolicy = New-Object TrustAllCertsPolicy
+            Write-Stamp 'Cert trust updated'
 
+            Invoke-WithRetry { Invoke-WebRequest -Uri $url -OutFile $dest -UseBasicParsing }
+            Write-Stamp 'Nuget downloaded'
             # Also copy to the user cache location to satisfy older loaders
-            $userCacheDir = Join-Path $env:LOCALAPPDATA 'PackageManagement\ProviderAssemblies\nuget\' + $nugetVer
+            $userCacheDir = Join-Path $env:LOCALAPPDATA "PackageManagement\ProviderAssemblies\nuget\$nugetVer"
             New-Item -ItemType Directory -Force -Path $userCacheDir | Out-Null
             Copy-Item $dest (Join-Path $userCacheDir $dllName) -Force
 
