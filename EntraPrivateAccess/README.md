@@ -349,6 +349,3 @@ EntraPrivateAccess/
 
 ---
 
-## License
-
-This project is provided as-is for community use. See the repository root for license details.
