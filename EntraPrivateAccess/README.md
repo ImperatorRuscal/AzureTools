@@ -296,6 +296,7 @@ This transcript contains timestamped output from every step of the bootstrap pro
 |---------|-------------|-----|
 | `joinDomain` fails | Domain controller unreachable, wrong credentials, or OU path doesn't exist | Verify subnet routing to DC, check `domainJoinUsername`/`domainJoinPassword`, verify OU path in AD |
 | `customScript` fails | Script download failed, or Key Vault access denied | Check `scriptSource` config; verify UAMI has `Key Vault Secrets User` on the vault |
+| `customScript` hangs at "Setting up PS Gallery" | DNS not yet working after domain join, or outbound internet blocked | Verify the subnet has outbound HTTPS access to `www.powershellgallery.com` and Azure IMDS; check NSG rules and DNS forwarder configuration |
 | `appHealth` reports unhealthy | `WAPCSvc` service not running | Check the bootstrap log for registration errors; verify registration credentials are valid |
 | Connector not visible in Entra admin center | Registration failed | Check bootstrap log for errors in the "Register the EPNC connector" section |
 | Auto-repair keeps replacing instances | Connector repeatedly failing to start | Investigate root cause in bootstrap log before it's replaced; consider increasing `gracePeriod` |
@@ -330,6 +331,7 @@ To assign connectors to a specific group, either:
 - **UAMI + RBAC, not access policies.** The deployment grants exactly the permissions needed -- `Key Vault Secrets User` on the vault, and optionally `Storage Blob Data Reader` on the storage account.
 - **Installer signature verification.** The bootstrapper validates the EPNC installer's Authenticode signature and confirms it was signed by Microsoft Corporation before executing.
 - **TLS 1.2 + strong cryptography.** The bootstrapper enables TLS 1.2 and sets `SchUseStrongCrypto` registry keys for both 32-bit and 64-bit .NET Framework paths.
+- **Fully non-interactive.** The bootstrapper installs Az modules by downloading `.nupkg` files directly from PSGallery, bypassing NuGet provider bootstrapping, PowerShellGet, and repository trust prompts that can hang in headless contexts. All Az telemetry/survey prompts, progress bars, and confirmation prompts are suppressed. The connector installer has a 10-minute timeout to prevent indefinite hangs.
 - **No `TrustAllCertsPolicy`.** Unlike some community scripts, this implementation does not disable SSL certificate validation.
 
 ---

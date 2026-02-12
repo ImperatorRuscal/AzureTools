@@ -7,7 +7,6 @@ param(
     [string] $ConnectorGroupName = '',
     [string] $InstallerUrl = 'https://download.msappproxy.net/Subscription/d3c8b69d-6bf7-42be-a529-3fe9c2e70c90/Connector/DownloadConnectorInstaller',
     [string] $InstallerFileName = 'MicrosoftEntraPrivateNetworkConnectorInstaller.exe',
-    [string] $NugetUrl = 'https://onegetcdn.azureedge.net/providers/Microsoft.PackageManagement.NuGetProvider-2.8.5.208.dll',
     [int]    $HealthPort = 8443
 )
 
@@ -15,6 +14,11 @@ $IsAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIde
 if (-not $IsAdmin) { Write-Error "Run elevated (Administrator)."; exit 1 }
 
 $ErrorActionPreference = 'Stop'
+$ProgressPreference    = 'SilentlyContinue'   # Progress bars slow Invoke-WebRequest to a crawl in non-interactive sessions
+
+# Suppress all Az module interactive prompts (telemetry, surveys, breaking-change warnings)
+$env:SuppressAzurePowerShellBreakingChangeWarnings = 'true'
+$env:Azure_PS_Data_Collection                      = 'true'
 
 #region "Statics"
 
@@ -69,82 +73,75 @@ $ErrorActionPreference = 'Stop'
     }
     Write-Stamp 'Strong crypto registry keys set'
 
-    $script:psGallery = $null
+    # Install a module by downloading its .nupkg directly from PSGallery.
+    # This bypasses NuGet provider, PackageManagement, PowerShellGet, and
+    # PSGallery trust — eliminating all interactive prompts that can hang
+    # in non-interactive contexts like CustomScriptExtension.
+    function Install-ModuleFromGallery {
+        param(
+            [Parameter(Mandatory)] [string]   $Name,
+            [string] $MinimumVersion = '0.0.0.0'
+        )
 
-    function Ensure-Module($name, $minVer = "0.0.0.0") {
-        Write-Stamp "Ensuring availability of module $name"
-        if (-not $script:psGallery) {
-            Write-Stamp 'Setting up PS Gallery'
+        # Skip if already available
+        if (Get-Module -ListAvailable -Name $Name | Where-Object { $_.Version -ge [version]$MinimumVersion }) {
+            Write-Stamp "Module $Name already installed (>= $MinimumVersion)"
+            return
+        }
 
-            try { $nuget = Get-PackageProvider -Name NuGet -ErrorAction SilentlyContinue } catch {}
-            if ((-not $nuget) -or ($nuget.Version -lt [version]"2.8.5.201")) {
-                Write-Stamp 'Installing NuGet provider'
-                $nugetVer    = '2.8.5.208'
-                $dllName     = 'Microsoft.PackageManagement.NuGetProvider.dll'
-                $providerRoot = Join-Path $env:ProgramFiles 'PackageManagement\ProviderAssemblies\nuget'
-                $providerDir  = Join-Path $providerRoot $nugetVer
-                New-Item -ItemType Directory -Force -Path $providerDir | Out-Null
+        Write-Stamp "Installing module $Name from PSGallery (direct download)"
 
-                $dest = Join-Path $providerDir $dllName
-                try {
-                    Invoke-WithRetry { Invoke-WebRequest -Uri $NugetUrl -OutFile $dest -UseBasicParsing }
-                    Write-Stamp 'NuGet provider downloaded'
-                    $userCacheDir = Join-Path $env:LOCALAPPDATA "PackageManagement\ProviderAssemblies\nuget\$nugetVer"
-                    New-Item -ItemType Directory -Force -Path $userCacheDir | Out-Null
-                    Copy-Item $dest (Join-Path $userCacheDir $dllName) -Force
-                } catch {
-                    Write-Stamp "NuGet download failed: $_" 'WARN'
+        $galleryApi = "https://www.powershellgallery.com/api/v2/FindPackagesById()?id='$Name'&`$orderby=Version desc&`$top=1"
+        $feedXml    = Invoke-WithRetry {
+            [xml](Invoke-WebRequest -Uri $galleryApi -UseBasicParsing -TimeoutSec 30).Content
+        }
+        $entry      = $feedXml.feed.entry
+        $packageUrl = $entry.content.src
+        $version    = $entry.properties.Version
+
+        if ([version]$version -lt [version]$MinimumVersion) {
+            throw "Latest $Name version ($version) is below required minimum ($MinimumVersion)"
+        }
+
+        Write-Stamp "Downloading $Name $version"
+        $nupkgPath = Join-Path ([IO.Path]::GetTempPath()) "$Name.$version.nupkg"
+        Invoke-WithRetry { Invoke-WebRequest -Uri $packageUrl -OutFile $nupkgPath -UseBasicParsing -TimeoutSec 60 }
+
+        $installDir = Join-Path "$env:ProgramFiles\WindowsPowerShell\Modules" "$Name\$version"
+        New-Item -ItemType Directory -Force -Path $installDir | Out-Null
+
+        Write-Stamp "Extracting $Name to $installDir"
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
+        $zip = [IO.Compression.ZipFile]::OpenRead($nupkgPath)
+        try {
+            foreach ($zipEntry in $zip.Entries) {
+                # Skip NuGet packaging metadata — only extract module files
+                if ($zipEntry.FullName -match '^\[Content_Types\]|^_rels/|^package/|\.nuspec$') { continue }
+                $destPath = Join-Path $installDir $zipEntry.FullName
+                $destDir  = Split-Path $destPath -Parent
+                if (-not (Test-Path $destDir)) { New-Item -ItemType Directory -Force -Path $destDir | Out-Null }
+                if ($zipEntry.Name) {
+                    [IO.Compression.ZipFileExtensions]::ExtractToFile($zipEntry, $destPath, $true)
                 }
             }
-
-            $pmMin = [Version]'1.4.8.1'
-            $pgMin = [Version]'2.2.5'
-            $pm = Get-Module PackageManagement -ListAvailable | Sort-Object Version -Descending | Select-Object -First 1
-            $pg = Get-Module PowerShellGet    -ListAvailable | Sort-Object Version -Descending | Select-Object -First 1
-
-            if (-not $pm -or $pm.Version -lt $pmMin) {
-                Write-Stamp 'Installing PackageManagement'
-                Install-Module PackageManagement -MinimumVersion $pmMin -Force -AllowClobber -Confirm:$false -Scope AllUsers
-            }
-            if (-not $pg -or $pg.Version -lt $pgMin) {
-                Write-Stamp 'Installing PowerShellGet'
-                Install-Module PowerShellGet -MinimumVersion $pgMin -Force -AllowClobber -Confirm:$false -Scope AllUsers
-            }
-
-            Remove-Module PackageManagement, PowerShellGet -ErrorAction SilentlyContinue
-            Import-Module PackageManagement
-            Import-Module PowerShellGet
-
-            try {
-                if ((Get-PSRepository -Name PSGallery -ErrorAction SilentlyContinue).InstallationPolicy -ne 'Trusted') {
-                    Write-Stamp 'Trusting PSGallery'
-                    Set-PSRepository -Name PSGallery -InstallationPolicy Trusted
-                }
-            } catch {}
-
-            $nuget = Get-PackageProvider -Name NuGet -ErrorAction SilentlyContinue
-            if ((-not $nuget) -or ($nuget.Version -lt [version]"2.8.5.201")) {
-                Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force -ForceBootstrap -Confirm:$false | Out-Null
-            }
+        } finally {
+            $zip.Dispose()
         }
-        if (-not $script:psGallery) { $script:psGallery = Get-PSRepository -Name PSGallery -ErrorAction SilentlyContinue }
-        if (-not $script:psGallery) { Register-PSRepository -Default | Out-Null; $script:psGallery = Get-PSRepository -Name PSGallery -ErrorAction SilentlyContinue }
-        if ($script:psGallery.InstallationPolicy -ne 'Trusted') { Set-PSRepository -Name PSGallery -InstallationPolicy Trusted }
-        if (-not (Get-Module -ListAvailable -Name $name | Where-Object { $_.Version -ge [version]$minVer })) {
-            Write-Stamp "Installing PS Module :: $name"
-            Install-Module $name -Force -AllowClobber -Scope AllUsers -MinimumVersion $minVer
-        }
+
+        Remove-Item $nupkgPath -Force -ErrorAction SilentlyContinue
+        Write-Stamp "Module $Name $version installed"
     }
 
 #endregion
 
 #region "Connect to Azure and retrieve registration credentials"
 
-    Ensure-Module -name Az.Accounts
-    Ensure-Module -name Az.KeyVault
+    Install-ModuleFromGallery -Name Az.Accounts
+    Install-ModuleFromGallery -Name Az.KeyVault
 
     Write-Stamp "Connecting to Azure (Managed Identity: $UamiClientId)"
-    $azCon = Connect-AzAccount -Identity -AccountId $UamiClientId
+    Disable-AzContextAutosave -Scope Process -ErrorAction SilentlyContinue | Out-Null
+    $azCon = Connect-AzAccount -Identity -AccountId $UamiClientId -SkipContextPopulation
 
     Write-Stamp "Fetching registration credentials from Key Vault '$KeyVaultName'"
     $regUser = Get-PlainText (Invoke-WithRetry { Get-AzKeyVaultSecret -VaultName $KeyVaultName -Name $RegistrationUserSecretName }).SecretValue
@@ -172,7 +169,12 @@ $ErrorActionPreference = 'Stop'
 
         $installArgs = 'REGISTERCONNECTOR="false" REBOOT=ReallySuppress /q'
         Write-Stamp "Installing connector (quiet, no reboot) -> $installerPath"
-        $proc = Start-Process -FilePath $installerPath -ArgumentList $installArgs -PassThru -Wait
+        $proc = Start-Process -FilePath $installerPath -ArgumentList $installArgs -PassThru
+        $timeoutMs = 10 * 60 * 1000  # 10 minutes
+        if (-not $proc.WaitForExit($timeoutMs)) {
+            $proc.Kill()
+            throw "Connector installer timed out after 10 minutes"
+        }
         if ($proc.ExitCode -ne 0) { throw "Connector installer exited with code $($proc.ExitCode)" }
         Write-Stamp "Connector installed successfully"
     } else {
@@ -276,7 +278,7 @@ while (`$listener.IsListening) {
     netsh http add urlacl url="http://+:$HealthPort/health/" user="NT AUTHORITY\SYSTEM" | Out-Null
 
     # Open the firewall for the health port
-    New-NetFirewallRule -DisplayName 'EPA Health Listener' -Direction Inbound -Protocol TCP -LocalPort $HealthPort -Action Allow -ErrorAction SilentlyContinue | Out-Null
+    New-NetFirewallRule -DisplayName 'EPA Health Listener' -Direction Inbound -Protocol TCP -LocalPort $HealthPort -Action Allow -Confirm:$false -ErrorAction SilentlyContinue | Out-Null
     Write-Stamp "Firewall rule added for port $HealthPort"
 
     # Register as a scheduled task that starts at boot and runs persistently
@@ -291,9 +293,15 @@ while (`$listener.IsListening) {
         Write-Stamp "Health listener scheduled task registered"
     }
 
-    # Start the task immediately
+    # Start the task immediately and verify it's running
     Start-ScheduledTask -TaskName $healthTaskName -TaskPath '\'
-    Write-Stamp "Health listener started on port $HealthPort"
+    Start-Sleep -Seconds 2
+    $taskInfo = Get-ScheduledTask -TaskName $healthTaskName -TaskPath '\' -ErrorAction SilentlyContinue
+    if ($taskInfo.State -ne 'Running') {
+        Write-Stamp "Health listener task state: $($taskInfo.State) (expected Running)" 'WARN'
+    } else {
+        Write-Stamp "Health listener started on port $HealthPort"
+    }
 
 #endregion
 
