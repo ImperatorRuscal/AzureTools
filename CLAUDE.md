@@ -12,11 +12,17 @@ AzureTools is a collection of Azure infrastructure automation and certificate ma
 
 ### EntraPrivateAccess
 
-Automates deployment of Microsoft Entra Private Access connectors on Azure VM Scale Sets.
+Automates deployment of Microsoft Entra Private Network Connectors on Azure VM Scale Sets (Flexible orchestration). The VMSS instances auto-join an AD domain, install and register the EPNC connector, and report health — all hands-off after initial deployment.
 
-- **epa-Connector-vmss.bicep** — Bicep IaC defining VMSS with rolling upgrades, CPU-based autoscaling (1-10 instances), health monitoring, and custom script extension.
-- **epa-connector-vmss.json** — ARM template compiled from the Bicep file (generated via `az bicep build`).
-- **epa-bootstrapper.ps1** — PowerShell bootstrap script run on each VM instance. Handles AD domain join, EPA Connector installation, credential retrieval from Key Vault via Managed Identity/IMDS, and scheduled task registration.
+- **epa-Connector-vmss.bicep** — Bicep template defining the VMSS with three ordered extensions: `JsonADDomainExtension` (domain join), `CustomScriptExtension` (connector install/register), `ApplicationHealthWindows` (HTTP health probe on port 8443 checking the WAPCSvc service). Includes CPU-based autoscaling, automatic instance repair, and rolling upgrade policy. Supports two script source modes: public GitHub URL (community) or Azure Storage + managed identity (production).
+- **epa-connector-vmss.sample.bicepparam** — Sample parameters file showing Key Vault secret references for `adminPassword` and `domainJoinPassword` via `az.getSecret()`.
+- **epa-bootstrapper.ps1** — PowerShell script run by the CustomScriptExtension after domain join. Installs the EPNC connector, registers it with Entra via credentials from Key Vault, and starts a persistent HTTP health listener. All config comes via command-line parameters (no IMDS tag reading).
+
+Key design decisions:
+- Domain join handled by Azure's `JsonADDomainExtension`, not PowerShell (eliminates reboot-and-resume fragility).
+- No secrets in VMSS tags or visible extension settings. `commandToExecute` is in `protectedSettings`.
+- Automatic instance repair replaces unhealthy VMs (WAPCSvc not running for 30 min).
+- Connector group assignment is a TODO (requires Graph Beta API + UAMI permissions).
 
 ### SSL-Updater
 
@@ -26,15 +32,15 @@ Automated SSL/TLS certificate lifecycle management for Azure AD Application Prox
 
 ## Key Architectural Patterns
 
-- **Managed Identity everywhere** — VMs use User Assigned Managed Identities; no service principal keys stored on infrastructure.
-- **Key Vault for all secrets** — Credentials referenced via VMSS tags and retrieved at runtime through IMDS + Managed Identity.
-- **Bicep as source of truth** — The ARM JSON template is a build artifact from Bicep, not hand-edited.
-- **Bootstrap via Custom Script Extension** — PowerShell runs at VM startup with retry logic and exponential backoff; Application Health extension monitors readiness.
+- **Managed Identity everywhere** — VMs use User Assigned Managed Identities for Key Vault access and (optionally) storage account script download. No service principal keys on infrastructure.
+- **Key Vault for all secrets** — Admin password and domain join password supplied via Key Vault references at deploy time. Registration credentials fetched at runtime via Managed Identity.
+- **Bicep as source of truth** — No ARM JSON template is checked in. Generate one with `az bicep build` if needed.
+- **Extension-driven provisioning** — Domain join, bootstrapping, and health monitoring are handled by Azure VM extensions with explicit ordering (`provisionAfterExtensions`), not multi-phase scripts.
 
 ## Working with the Code
 
-There is no build system, package manager, or test framework. The codebase is PowerShell scripts and Azure Bicep/ARM templates.
+There is no build system, package manager, or test framework. The codebase is PowerShell scripts and Azure Bicep templates.
 
-- To compile Bicep to ARM: `az bicep build --file EntraPrivateAccess/epa-Connector-vmss.bicep`
-- To deploy the VMSS: `az deployment group create --resource-group <rg> --template-file EntraPrivateAccess/epa-Connector-vmss.bicep --parameters <params>`
-- PowerShell scripts use `$ErrorActionPreference = 'Stop'` and transcript logging for diagnostics.
+- To validate Bicep: `az bicep build --file EntraPrivateAccess/epa-Connector-vmss.bicep`
+- To deploy the VMSS: `az deployment group create --resource-group <rg> --template-file EntraPrivateAccess/epa-Connector-vmss.bicep --parameters EntraPrivateAccess/epa-connector-vmss.sample.bicepparam`
+- PowerShell scripts use `$ErrorActionPreference = 'Stop'` and transcript logging to `C:\Scripts\`.
