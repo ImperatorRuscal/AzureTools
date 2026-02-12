@@ -141,11 +141,27 @@ az deployment group create \
 
 That's it. The deployment will:
 1. Create (or update) the UAMI.
-2. Grant the UAMI `Key Vault Secrets User` on your Key Vault.
+2. Grant the UAMI `Key Vault Secrets User` on your Key Vault (best-effort -- see note below).
 3. Deploy the VMSS with all three extensions chained.
 4. Configure CPU-based autoscaling and automatic instance repair.
 
 Each new VM instance will automatically join the domain, install the connector, register with Entra, and start reporting health.
+
+> **Note on Key Vault permissions:** The Bicep deployment attempts to create the RBAC role assignment automatically, but this can fail silently if the deploying principal lacks `Owner` or `User Access Administrator` on the Key Vault resource group. Additionally, Azure RBAC assignments are eventually consistent and may take several minutes to propagate after deployment. The bootstrapper retries with exponential back-off to handle propagation delays, but if instances consistently fail with `Forbidden` errors on Key Vault access, verify that the UAMI has the **Secret → Get** permission on the vault. You can grant this manually:
+>
+> ```bash
+> # Using RBAC (recommended)
+> az role assignment create \
+>   --assignee-object-id <UAMI-principal-id> \
+>   --assignee-principal-type ServicePrincipal \
+>   --role "Key Vault Secrets User" \
+>   --scope /subscriptions/<sub>/resourceGroups/<rg>/providers/Microsoft.KeyVault/vaults/<vault-name>
+>
+> # Or using access policies (legacy)
+> az keyvault set-policy --name <vault-name> \
+>   --object-id <UAMI-principal-id> \
+>   --secret-permissions get
+> ```
 
 ---
 
