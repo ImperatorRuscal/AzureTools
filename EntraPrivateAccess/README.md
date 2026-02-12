@@ -257,12 +257,12 @@ Bicep/ARM deployments are idempotent. The rolling upgrade policy will gradually 
 
 ## Health Monitoring and Auto-Repair
 
-Each VMSS instance runs a lightweight HTTP health listener on port 8443 (configurable). The listener checks the `WAPCSvc` Windows service (the EPNC connector service):
+Each VMSS instance runs a lightweight HTTP health listener on port 8443 (configurable). The listener checks the `WAPCSvc` Windows service (the EPNC connector service) and returns responses conforming to the Azure [Rich Health States](https://learn.microsoft.com/en-us/azure/virtual-machine-scale-sets/virtual-machine-scale-sets-health-extension?tabs=rest-api#rich-health-states) protocol (all responses are HTTP 200; health state is conveyed in the response body):
 
-- **HTTP 200** `{"status":"Healthy","service":"WAPCSvc","state":"Running"}` -- connector is running.
-- **HTTP 503** `{"status":"Unhealthy","service":"WAPCSvc","state":"..."}` -- connector is stopped or missing.
+- **Healthy:** `{"ApplicationHealthState":"Healthy","service":"WAPCSvc","state":"Running"}` -- connector is running.
+- **Unhealthy:** `{"ApplicationHealthState":"Unhealthy","service":"WAPCSvc","state":"..."}` -- connector is stopped or missing.
 
-The `ApplicationHealthWindows` extension probes this endpoint every 30 seconds. If an instance reports unhealthy for 30 minutes, the **automatic repair policy** replaces the VM entirely -- a fresh instance joins the domain, reinstalls the connector, and registers.
+The `ApplicationHealthWindows` extension (v2.0, Rich Health States) probes this endpoint every 30 seconds. Newly created instances enter an **Initializing** state with a 10-minute grace period, requiring 2 consecutive healthy probes before being considered healthy. If an instance reports unhealthy for 30 minutes, the **automatic repair policy** replaces the VM entirely -- a fresh instance joins the domain, reinstalls the connector, and registers.
 
 ### Testing Health Locally
 

@@ -22,7 +22,7 @@ $env:Azure_PS_Data_Collection                      = 'true'
 
 #region "Statics"
 
-    $ScriptVersion = '2.1.0'   # Bump on each meaningful change to aid log-based troubleshooting
+    $ScriptVersion = '2.2.0'   # Bump on each meaningful change to aid log-based troubleshooting
 
     $regScript = "$env:ProgramFiles\Microsoft Entra private network connector\RegisterConnector.ps1"
     $modPath   = "$env:ProgramFiles\Microsoft Entra private network connector\Modules\"
@@ -283,14 +283,16 @@ while (`$listener.IsListening) {
         `$context  = `$listener.GetContext()
         `$response = `$context.Response
 
+        # Rich Health States (typeHandlerVersion 2.0) requires:
+        #   - HTTP 200 for ALL responses (healthy AND unhealthy)
+        #   - "ApplicationHealthState" key in JSON body with value "Healthy" or "Unhealthy"
+        `$response.StatusCode = 200
         `$svc = Get-Service -Name 'WAPCSvc' -ErrorAction SilentlyContinue
         if (`$svc -and `$svc.Status -eq 'Running') {
-            `$response.StatusCode = 200
-            `$body = '{"status":"Healthy","service":"WAPCSvc","state":"Running"}'
+            `$body = '{"ApplicationHealthState":"Healthy","service":"WAPCSvc","state":"Running"}'
         } else {
-            `$response.StatusCode = 503
             `$state = if (`$svc) { `$svc.Status.ToString() } else { 'NotFound' }
-            `$body = '{"status":"Unhealthy","service":"WAPCSvc","state":"' + `$state + '"}'
+            `$body = '{"ApplicationHealthState":"Unhealthy","service":"WAPCSvc","state":"' + `$state + '"}'
         }
 
         `$response.ContentType    = 'application/json'
