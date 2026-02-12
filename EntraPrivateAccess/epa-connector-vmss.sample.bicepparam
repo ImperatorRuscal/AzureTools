@@ -64,6 +64,6 @@ param scriptSource = 'github'
 // param vmSize = 'Standard_B2ms'
 // param adminUsername = 'azAdministrator'
 // param uamiName = 'uami-entraprivateconnector'
-// param minInstanceCount = 1
+// param minInstanceCount = 2
 // param maxInstanceCount = 10
 // param healthPort = 8443

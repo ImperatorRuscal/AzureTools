@@ -70,6 +70,8 @@ You need a Key Vault with **four secrets**:
 
 The registration credentials (`epaReg-*`) are for an Entra account that has permission to register Private Network Connectors. This is typically a Global Administrator or an account with the Application Administrator role.
 
+> **Important:** The registration account must **not** require multi-factor authentication (MFA) or interactive conditional access policies. The connector registration runs unattended on each VMSS instance using the `Credentials` auth mode, which cannot satisfy interactive MFA prompts. If your tenant enforces MFA broadly, create a conditional access exclusion for this service account (scoped to the Private Network Connector registration action) or use a dedicated account with MFA disabled.
+
 **Enable template deployment** on the Key Vault so Bicep can resolve `az.getSecret()` references at deployment time:
 
 ```bash
@@ -209,7 +211,7 @@ The deployment will automatically grant the UAMI `Storage Blob Data Reader` on t
 | `scriptStorageAccountName`         | string | `''`                                      | Storage account name (for RBAC)                                   |
 | `scriptStorageAccountResourceGroupName` | string | `''` (same as deployment RG)         | Resource group of the storage account                             |
 | `connectorGroupName`               | string | `''`                                      | Connector group to assign (see note below)                        |
-| `minInstanceCount`                 | int    | `1`                                       | Autoscale minimum instances                                       |
+| `minInstanceCount`                 | int    | `2`                                       | Autoscale minimum instances (2+ for high availability)            |
 | `maxInstanceCount`                 | int    | `10`                                      | Autoscale maximum instances                                       |
 | `healthPort`                       | int    | `8443`                                    | Port for the health HTTP listener                                 |
 

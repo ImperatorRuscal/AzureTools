@@ -97,9 +97,9 @@ param scriptStorageAccountResourceGroupName string = ''
 param connectorGroupName string = ''
 
 // ---- Scaling ----
-@description('Minimum number of VMSS instances')
+@description('Minimum number of VMSS instances (2+ recommended for high availability)')
 @minValue(1)
-param minInstanceCount int = 1
+param minInstanceCount int = 2
 
 @description('Maximum number of VMSS instances')
 @minValue(1)
@@ -124,7 +124,7 @@ var scriptFileName = 'epa-bootstrapper.ps1'
 // Build the commandToExecute string with all required parameters for the bootstrapper.
 // This goes into protectedSettings so it is encrypted and not visible in the portal.
 var connectorGroupArg = connectorGroupName != '' ? ' -ConnectorGroupName "${connectorGroupName}"' : ''
-var commandToExecute = 'powershell -ExecutionPolicy Bypass -File .\\${scriptFileName} -KeyVaultName "${keyVaultName}" -RegistrationUserSecretName "${registrationUserSecretName}" -RegistrationPasswordSecretName "${registrationPasswordSecretName}" -HealthPort ${healthPort}${connectorGroupArg}'
+var commandToExecute = 'powershell -ExecutionPolicy Bypass -File .\\${scriptFileName} -KeyVaultName "${keyVaultName}" -RegistrationUserSecretName "${registrationUserSecretName}" -RegistrationPasswordSecretName "${registrationPasswordSecretName}" -UamiClientId "${uami.properties.clientId}" -HealthPort ${healthPort}${connectorGroupArg}'
 
 // Conditional CSE settings based on script source
 var useStorageAccount = scriptSource == 'storageAccount'

@@ -3,6 +3,7 @@ param(
     [Parameter(Mandatory)] [string] $KeyVaultName,
     [Parameter(Mandatory)] [string] $RegistrationUserSecretName,
     [Parameter(Mandatory)] [string] $RegistrationPasswordSecretName,
+    [Parameter(Mandatory)] [string] $UamiClientId,
     [string] $ConnectorGroupName = '',
     [string] $InstallerUrl = 'https://download.msappproxy.net/Subscription/d3c8b69d-6bf7-42be-a529-3fe9c2e70c90/Connector/DownloadConnectorInstaller',
     [string] $InstallerFileName = 'MicrosoftEntraPrivateNetworkConnectorInstaller.exe',
@@ -142,8 +143,8 @@ $ErrorActionPreference = 'Stop'
     Ensure-Module -name Az.Accounts
     Ensure-Module -name Az.KeyVault
 
-    Write-Stamp "Connecting to Azure (Managed Identity)"
-    $azCon = Connect-AzAccount -Identity
+    Write-Stamp "Connecting to Azure (Managed Identity: $UamiClientId)"
+    $azCon = Connect-AzAccount -Identity -AccountId $UamiClientId
 
     Write-Stamp "Fetching registration credentials from Key Vault '$KeyVaultName'"
     $regUser = Get-PlainText (Invoke-WithRetry { Get-AzKeyVaultSecret -VaultName $KeyVaultName -Name $RegistrationUserSecretName }).SecretValue
