@@ -1,4 +1,3 @@
-
 #region Get Parameters
 
     Param(
@@ -11,16 +10,8 @@
         [Parameter(Mandatory,HelpMessage='The name of the Storage Container that holds the Blob with the PoSh-ACME settigns file.')]
         [String]$storageContainer,
 
-
-
         [Parameter(Mandatory,HelpMessage='The azure Key Vault that will hold the plugin arguments, PFX password, and the exported PFX files for created certificates.')]
         [string]$keyVault,
-
-        [Parameter(Mandatory,HelpMessage='The name of the Secret in the Key Vault that holds the UPN of the user account that will be used to login to Connect-AzureAD for managing the AzureAD App Proxy resources.  The user listed in the vault needs to be a member of the Application Administrator role.')]
-        [string]$proxyAdminUPNSecretName,
-
-        [Parameter(Mandatory,HelpMessage='The name of the Secret in the Key Vault that holds the password for the user listed under ProxyAdminUPN.')]
-        [string]$proxyAdminPassSecretName,
 
         [Parameter(Mandatory,HelpMessage='The name of the Secret in the Key Vault that holds the password used to encrypt the PFX files created by PoSh-ACME')]
         [string]$pfxSecretName,
@@ -44,11 +35,8 @@
         [Parameter(HelpMessage='Time (in seconds) that the client should wait for a validation result from the ACME server.  If positive validation is not received in this time, the client assumes that validation has failed.')]
         [int]$ValidationTimeout=60,
 
-
-
         [Parameter(HelpMessage='A regular expression that will match the subject of certificates that shouldn''t be updated/renewed by this script.  Original intent was to match on subjects for EV certificates that we''re still going to be purchasing.')]
         [string]$RegExDontUpdateTheseCerts='^$',
-
 
         [Parameter(HelpMessage='The minimum number of days left before the cert should be forced to renew.')]
         [ValidateRange(1,50)]
@@ -64,12 +52,151 @@
         [Parameter(HelpMessage='Do you want to save a copy of the certificate back to the Key Vault?  Default: TRUE')]
         [bool]$SaveCertificateToKeyVault = $true,
 
-        [Parameter()]
-        [bool]$WorkOnApplicationGateways = $false,
+        [Parameter(HelpMessage='Process Application Gateway listeners for certificate renewal.')]
+        [switch]$WorkOnApplicationGateways,
 
-        [Parameter()]
-        [bool]$WorkOnAppServicePlans = $false
+        [Parameter(HelpMessage='Process App Service Plan web apps for certificate renewal.')]
+        [switch]$WorkOnAppServicePlans,
+
+        [Parameter(HelpMessage='List which certs would be renewed without actually generating or applying certificates.')]
+        [switch]$DryRun
     )
+
+#endregion
+
+#region Helper Functions
+
+    function New-AcmeCertificateWithFallback {
+        param(
+            [string[]]$Subject,
+            [string]$FriendlyName,
+            [string]$Plugin,
+            [hashtable]$PluginArgs,
+            [System.Security.SecureString]$PfxPassword,
+            [int]$Sleep,
+            [int]$Timeout,
+            [string]$Alias
+        )
+        try {
+            Write-Output "                with a direct TXT record on the A-record"
+            $cert = New-PACertificate -Domain $Subject -DnsPlugin $Plugin -PluginArgs $PluginArgs -FriendlyName $FriendlyName -PfxPassSecure $PfxPassword -Force -Verbose -DnsSleep $Sleep -ValidationTimeout $Timeout
+        } catch {
+            if ($Alias) {
+                Write-Output "                with an indirect TXT record on the CNAME"
+                $cert = New-PACertificate -Domain $Subject -DnsAlias $Alias -DnsPlugin $Plugin -PluginArgs $PluginArgs -FriendlyName $FriendlyName -PfxPassSecure $PfxPassword -Force -Verbose -DnsSleep $Sleep -ValidationTimeout $Timeout
+            } else {
+                throw
+            }
+        }
+        return $cert
+    }
+
+    function Remove-AcmeSensitiveFiles {
+        param([string]$CertKeyFile)
+        if (-not $CertKeyFile) { return }
+        $cleanupPath = $CertKeyFile.Substring(0, $CertKeyFile.LastIndexOf('\'))
+        foreach ($filter in @('*.bak','*.csr','*.key','*.cer','*.pfx','pluginargs.json')) {
+            Get-ChildItem -Path $cleanupPath -File -Filter $filter -Recurse | Remove-Item -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    function Save-CertToKeyVault {
+        param(
+            [string]$VaultName,
+            [string]$SubjectName,
+            [string]$PfxPath,
+            [System.Security.SecureString]$PfxPassword
+        )
+        Write-Output "        saving a copy of the PFX to the keyvault"
+        $kvName = $SubjectName.Replace('.','-')
+        Import-AzKeyVaultCertificate -VaultName $VaultName -Name $kvName -FilePath $PfxPath -Password $PfxPassword | Out-Null
+        Write-Output "        saved $kvName to $VaultName"
+    }
+
+    function Get-AzAppGWCert {
+        param(
+            [string]$RG,
+            [string]$AppGWName,
+            [switch]$Details,
+            [switch]$Export
+        )
+
+        if ($AppGWName -and $RG) {
+            $AppGWs = Get-AzApplicationGateway -ResourceGroupName $RG -Name $AppGWName
+        } elseif ($RG) {
+            $AppGWs = Get-AzApplicationGateway -ResourceGroupName $RG
+        } elseif ($AppGWName) {
+            throw "-AppGWName requires parameter -RG (ResourceGroup)"
+        } else {
+            $AppGWs = Get-AzApplicationGateway
+        }
+
+        $TemplateObject = New-Object PSObject | Select-Object AppGWName,ResourceGroupName,ListenerName,Subject,Issuer,SerialNumber,Thumbprint,NotBefore,NotAfter
+        $TemplateObjectBackEnd = New-Object PSObject | Select-Object AppGWName,ResourceGroupName,HTTPSetting,RuleName,BackendCertName,Subject,Issuer,SerialNumber,Thumbprint,NotBefore,NotAfter
+
+        foreach ($AppGW in $AppGWs) {
+            $httpsListeners = $AppGW.HttpListeners | Where-Object { $_.Protocol -eq "HTTPS" }
+            foreach ($httpsListener in $httpsListeners) {
+                $httpsListenerSSLCert = ($AppGW.SslCertificatesText | ConvertFrom-Json) | Where-Object { $_.Id -eq $httpsListener.SslCertificate.Id }
+                $httpsListenerSSLCertObj = [System.Security.Cryptography.X509Certificates.X509Certificate2]([System.Convert]::FromBase64String($httpsListenerSSLCert.PublicCertData.Substring(60, $httpsListenerSSLCert.PublicCertData.Length - 60)))
+
+                $WorkingObject = $TemplateObject | Select-Object *
+                $WorkingObject.AppGWName = $AppGW.Name
+                $WorkingObject.ResourceGroupName = $AppGW.ResourceGroupName
+                $WorkingObject.ListenerName = $httpsListener.Name
+                $WorkingObject.Subject = $httpsListenerSSLCertObj.Subject
+                $WorkingObject.Issuer = $httpsListenerSSLCertObj.Issuer
+                $WorkingObject.SerialNumber = $httpsListenerSSLCertObj.SerialNumber
+                $WorkingObject.Thumbprint = $httpsListenerSSLCertObj.Thumbprint
+                $WorkingObject.NotBefore = $httpsListenerSSLCertObj.NotBefore
+                $WorkingObject.NotAfter = $httpsListenerSSLCertObj.NotAfter
+                $WorkingObject
+
+                if ($Details) {
+                    $httpsListenerSSLCertObj | Select-Object *
+                }
+                if ($Export) {
+                    [System.IO.File]::WriteAllBytes((Join-Path (Resolve-Path .\).Path "$($AppGW.Name)-$($AppGW.ResourceGroupName)-$($httpsListener.Name).cer"), $httpsListenerSSLCertObj.RawData)
+                }
+            }
+
+            $Rules = ($AppGW.RequestRoutingRulesText | ConvertFrom-Json)
+
+            foreach ($rule in $Rules) {
+                $RuleHttpSettingsID = $rule.BackendHttpSettings.ID
+                $BackendHttpSettings = ($AppGW.BackendHttpSettingsCollectionText | ConvertFrom-Json) | Where-Object { $_.Id -eq $RuleHttpSettingsID } | Where-Object { $_.Protocol -eq "HTTPS" }
+                if ($null -ne $BackendHttpSettings) {
+                    $BackendHttpSettingsCerts = $BackendHttpSettings.AuthenticationCertificates
+                    foreach ($BackendHttpSettingsCert in $BackendHttpSettingsCerts) {
+                        $BackendCerts = ($AppGW.AuthenticationCertificatesText | ConvertFrom-Json) | Where-Object { $_.Id -eq $BackendHttpSettingsCert.Id }
+                        foreach ($BackendCert in $BackendCerts) {
+                            $BackendCertObj = [System.Security.Cryptography.X509Certificates.X509Certificate2]([System.Convert]::FromBase64String($BackendCert.Data))
+
+                            $WorkingObjectBackEnd = $TemplateObjectBackEnd | Select-Object *
+                            $WorkingObjectBackEnd.AppGWName = $AppGW.Name
+                            $WorkingObjectBackEnd.ResourceGroupName = $AppGW.ResourceGroupName
+                            $WorkingObjectBackEnd.RuleName = $rule.Name
+                            $WorkingObjectBackEnd.HTTPSetting = $BackendHttpSettings.Name
+                            $WorkingObjectBackEnd.BackendCertName = $BackendCert.Name
+                            $WorkingObjectBackEnd.Subject = $BackendCertObj.Subject
+                            $WorkingObjectBackEnd.Issuer = $BackendCertObj.Issuer
+                            $WorkingObjectBackEnd.SerialNumber = $BackendCertObj.SerialNumber
+                            $WorkingObjectBackEnd.Thumbprint = $BackendCertObj.Thumbprint
+                            $WorkingObjectBackEnd.NotBefore = $BackendCertObj.NotBefore
+                            $WorkingObjectBackEnd.NotAfter = $BackendCertObj.NotAfter
+                            $WorkingObjectBackEnd
+                            if ($Details) {
+                                $BackendCertObj | Select-Object *
+                            }
+                            if ($Export) {
+                                [System.IO.File]::WriteAllBytes((Join-Path (Resolve-Path .\).Path "$($AppGW.Name)-$($AppGW.ResourceGroupName)-$($rule.Name)-$($BackendHttpSettings.Name)-$($BackendCert.Name).cer"), $BackendCertObj.RawData)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 
 #endregion
 
@@ -77,35 +204,17 @@
     Write-Output "Getting Az Connection"
 	$AzConnect = Connect-AzAccount -Identity
 	Write-Output "     Az Connection completed"
-	
+
     $context = Get-AzContext
-    
-	### You STILL cannot use a Service Principal to manage AzureAD Proxy resources -- it was a nice try
-	# $graphToken = [Microsoft.Azure.Commands.Common.Authentication.AzureSession]::Instance.AuthenticationFactory.Authenticate($context.Account, $context.Environment, $context.Tenant.Id.ToString(), $null, [Microsoft.Azure.Commands.Common.Authentication.ShowDialog]::Never, $null, "https://graph.microsoft.com").AccessToken
-    # $aadToken = [Microsoft.Azure.Commands.Common.Authentication.AzureSession]::Instance.AuthenticationFactory.Authenticate($context.Account, $context.Environment, $context.Tenant.Id.ToString(), $null, [Microsoft.Azure.Commands.Common.Authentication.ShowDialog]::Never, $null, "https://graph.windows.net").AccessToken
-    # Connect-AzAccount -ServicePrincipal -Tenant $connection.TenantID -ApplicationId $connection.ApplicationID -CertificateThumbprint $connection.CertificateThumbprint
-    # $AzureConnect = Connect-AzureAD -AadAccessToken $aadToken -AccountId $context.Account.Id -TenantId $context.Tenant.Id -MsAccessToken $graphToken -AzureEnvironmentName AzureCloud
-    ###
-
-    Write-Output "Prepping for AzureAD Connection"
-
-    ### Lets get the creds so we can login a user to AzureAD, since they aren't keen of fixing the issue with Service Principals logging in
-    $proxyAdminUPN = Get-AzKeyVaultSecret -VaultName $keyVault -Name $proxyAdminUPNSecretName -AsPlainText
-    $proxyAdminPass = (Get-AzKeyVaultSecret -VaultName $keyVault -Name $proxyAdminPassSecretName).SecretValue
-    $proxyAdminCred = New-Object System.Management.Automation.PSCredential -ArgumentList $proxyAdminUPN, $proxyAdminPass
 
     Write-Output "     The context account is: $($context.Account.Id)"
     Write-Output "     The Tenant ID is: $($context.Tenant.Id)"
     Write-Output "     The subscription is: $($context.Subscription.Name)"
-    Write-Output "     The Proxy Admin UPN is: $proxyAdminUPN"
-
-	Write-Output "Getting AzureAD Connection"
-	$AzureConnect = Connect-AzureAD -AzureEnvironmentName AzureCloud -TenantId $context.Tenant.Id -AccountId $proxyAdminUPN -Credential $proxyAdminCred
 
     Import-Module Microsoft.Graph.Beta.Applications
     $MgConnect = Connect-MgGraph -Identity -NoWelcome
 
-	Write-Output "     AzureAD Connection completed"
+	Write-Output "     Microsoft Graph connection completed"
 #endregion
 
 #region Check if WriteLock is in place and try 3 more time
@@ -120,7 +229,7 @@
         $writeLock | Get-AzStorageBlobContent -Force
         if((Get-Date (Get-Content $writeLock.Name)[0]) -lt ((Get-Date).AddHours(-20)))
         {
-            Write-Output 'The lock is over 2 days old -- lets forceably clean that up'
+            Write-Output 'The lock is over 20 hours old -- lets forceably clean that up'
             Copy-AzStorageBlob -Context $storageAccount.Context -SrcContainer $storageContainer -SrcBlob "posh-acme.settings.lock" -DestContext $storageAccount.Context -DestContainer $storageContainer -DestBlob "posh-acme.settings.$((Get-Date).toString("yyyyMMddThhmm")).unlocked" -ErrorAction SilentlyContinue
             Remove-AzStorageBlob -Context $storageAccount.Context -Container $storageContainer -Blob "posh-acme.settings.lock" -Force
         }
@@ -167,18 +276,18 @@
 #region Setup the posh-acme settings
 	Write-Output "Configuring the ACME account"
     Set-PAServer $AcmeCertServer  # Use the Lets Encrypt Production server
-    if((Get-PAAccount -List -Status valid -Refresh) -eq $null)
+    if($null -eq (Get-PAAccount -List -Status valid -Refresh))
     {
         New-PAAccount -AcceptTOS -Contact $CertContact
     }
     $account = (Get-PAAccount -List -Status valid)[0] # Get the user account by ID (variable up top)
     Set-PAAccount -ID $account.id # Set that account as the active one
-    
+
 	Write-Output "Getting PFX password from the Key Vault"
     $CertPassword = Get-AzKeyVaultSecret -VaultName $keyVault -Name $pfxSecretName
 
 ###### TODO -- put in a case statement that uses $DnsProvider to set the plugin name and parameter key names -- needs continuation     https://poshac.me/docs/v4/Plugins/
-    
+
 	# Get DNS API parameters from the Azure KeyVault
     Remove-Variable AcmePlugin,AcmePluginArgs -ErrorAction SilentlyContinue
 	Write-Output "Setting up the DNS API parameters for [$DnsProvider]"
@@ -243,39 +352,27 @@
         default {
             $AcmePlugin = 'DMEasy'
             $AcmePluginArgs = @{ DMEKey=(Get-AzKeyVaultSecret -VaultName $keyVault -Name $DnsApiKeyName -AsPlainText); DMESecret=((Get-AzKeyVaultSecret -VaultName $keyVault -Name $DnsApiSecretName).SecretValue) }
-        } 
+        }
     }
 	Write-Output "        using plugin [$AcmePlugin]"
 #endregion
 
 #region Get all of the applications in the directory
     Write-Output "Reading service principals."
-    #$aadapServPrinc = Get-AzADServicePrincipal -First 1000000 | where-object {$_.Tags -Contains "WindowsAzureActiveDirectoryOnPremApp"}  
-    #$aadapServPrinc = Get-AzADServicePrincipal #| where-object {$_.Tags -Contains "WindowsAzureActiveDirectoryOnPremApp"}
-
-    #$aadapServPrinc = Get-AzureADServicePrincipal -All $true | where-object {$_.Tags -Contains "WindowsAzureActiveDirectoryOnPremApp"}  
     $aadapServPrinc = Get-MgBetaServicePrincipal -Top 100000 | Where-Object { $_.Tags -contains "WindowsAzureActiveDirectoryOnPremApp" }
 
-    Write-Output "Reading Azure AD applications.."
-    #$allApps = Get-AzADApplication -First 1000000 
-    #$allApps = Get-AzADApplication
-    #$allApps = Get-AzureADApplication -All $true
-
     Write-Output "Reading proxy applications..."
-    #$aadapApp = ($aadapServPrinc | ForEach-Object { $allApps -match $_.AppId}) | sort DisplayName
     $aadapApp = @()
-    $aadapServPrinc | sort DisplayName | %{$aadapApp += Get-MgBetaApplication -Filter "AppID eq '$($_.AppId)'"}
+    $aadapServPrinc | Sort-Object DisplayName | ForEach-Object { $aadapApp += Get-MgBetaApplication -Filter "AppID eq '$($_.AppId)'" }
 #endregion
 
 #region Cycle through all the apps, look for one with a cert near expiry, and update it.
     for($i=0; $i -lt $aadapApp.Count; $i++)
     {
         Write-Progress -CurrentOperation $aadapApp[$i].DisplayName -PercentComplete ((100*$i)/$aadapApp.Count) -Activity "Getting App Proxy Configs"
-        #$AadAppProxy = Get-AzureADApplicationProxyApplication -ObjectId $aadapApp[$i].ObjectId -ErrorAction SilentlyContinue
 
         $onPrem = Get-MgBetaApplication -ApplicationId $aadapApp[$i].Id -Select OnPremisesPublishing | Select-Object -ExpandProperty OnPremisesPublishing
         $certMeta = (Get-MgBetaApplication -ApplicationId $aadapApp[$i].Id -Select OnPremisesPublishing | Select-Object -ExpandProperty OnPremisesPublishing | Select-Object -ExpandProperty verifiedCustomDomainCertificatesMetadata)
-
 
         try
         {
@@ -318,68 +415,60 @@
                 } catch {
                     Write-Output "$($aadapApp[$i].DisplayName) Has no valid certificate -- UPDATING" -ErrorAction SilentlyContinue
                 }
-                #In case the External URL was changed and isn't in the current certificate, make sure it is in the new one.
-                If(-not $subject.contains($onPrem.ExternalUrl.Trim("https:").trim("/").split('/')[0]))
+                # Ensure the external URL hostname is in the subject list
+                $externalHost = ([Uri]$onPrem.ExternalUrl).Host
+                if(-not $subject.contains($externalHost))
                 {
-                    # If the FQDN of the URL isn't in the cert's subject, then we drop all lines and make a specific cert just for this FQDN
-                    $subject += $onPrem.ExternalUrl.Trim('https:').trim('/').split('/')[0]
+                    $subject += $externalHost
                 }
                 # Only submit subjects that are FQDN formatted (no orgs/etc)
-                $subject = [string[]]($subject | ?{$_.contains(".")})
-                try
+                $subject = [string[]]($subject | Where-Object { $_.contains(".") })
+
+                if($DryRun)
                 {
-					Write-Output "        generating new certificate"
-					try
-					{
-                        Remove-Variable AcmeCert, Exception -ErrorAction SilentlyContinue
-                        Write-Output "                with a direct TXT record on the A-record"
-                    	$AcmeCert = New-PACertificate -Domain $subject -DnsPlugin $AcmePlugin -PluginArgs $AcmePluginArgs -FriendlyName "$($aadapApp[$i].DisplayName) LetsEncrypt $((Get-Date).ToString("yyyy-MM-dd"))" -PfxPassSecure $CertPassword.SecretValue -Force -Verbose -DnsSleep $DnsSleep -ValidationTimeout $ValidationTimeout
-                        if($Exception -ne $null)
-                        {
-                            Write-Error ($Exception | ConvertTo-Json)
-                            Write-Error ($AcmePluginArgs | ConvertTo-Json)
-                        }
-					} catch {
-                        Write-Output "                with an indirect TXT record on the CNAME"
-						$AcmeCert = New-PACertificate -Domain $subject -DnsAlias $DnsAlias -DnsPlugin $AcmePlugin -PluginArgs $AcmePluginArgs -FriendlyName "$($aadapApp[$i].DisplayName) LetsEncrypt $((Get-Date).ToString("yyyy-MM-dd"))" -PfxPassSecure $CertPassword.SecretValue -Force -Verbose -DnsSleep $DnsSleep -ValidationTimeout $ValidationTimeout
-					}
-					Write-Output "        setting the certificate to AAD"
-
-                    #Set-AzureADApplicationProxyApplicationCustomDomainCertificate -ObjectId $aadapApp[$i].ObjectId -PfxFilePath $AcmeCert.PfxFullChain -Password $CertPassword.SecretValue
-                    $plainPfxPassword = [Runtime.InteropServices.Marshal]::PtrToStringAuto([Runtime.InteropServices.Marshal]::SecureStringToBSTR($CertPassword.SecretValue))
-                    $params = @{
-                      onPremisesPublishing = @{
-                        verifiedCustomDomainKeyCredential = @{
-                          type  = "X509CertAndPassword"
-                          value = [Convert]::ToBase64String((Get-Content $AcmeCert.PfxFullChain -Encoding Byte))
-                        }
-                        verifiedCustomDomainPasswordCredential = @{
-                          value = $plainPfxPassword
-                        }
-                      }
-                    }
-                    Update-MgBetaApplication -ApplicationId $aadapApp[$i].Id -BodyParameter $params
-
-					Write-Output "        certificate replaced"
-                    if($SaveCertificateToKeyVault)
-                    {
-					    Write-Output "        saving a copy of the PFX to the keyvault"
-					    Import-AzKeyVaultCertificate -VaultName $keyVault -Name $subject[0].replace('.','-') -FilePath $AcmeCert.PfxFullChain -Password $CertPassword.SecretValue | Out-Null
-                        Write-Output "        saved $($subject[0].replace('.','-')) to $keyvault"
-                    }
-				} catch {
-                    Write-Output "!!! ERROR !!! Unable to set the certificate for $($AadAppProxy.ExternalUrl)"
-                    Write-Output "        $($Error[0].Exception)"
-                    break
+                    Write-Output "        [DRY RUN] Would generate and apply certificate for: $($subject -join ', ')"
                 }
-                # Cleanup private keys so they aren't hanging about on unsecured machines
-				$cleanupPath = $AcmeCert.KeyFile.Substring(0,$AcmeCert.KeyFile.LastIndexOf('\'))
-				Get-ChildItem -Path $cleanupPath -File -Filter "*.bak" -Recurse | Remove-Item -Force -ErrorAction SilentlyContinue
-                Get-ChildItem -Path $cleanupPath -File -Filter "*.csr" -Recurse | Remove-Item -Force -ErrorAction SilentlyContinue
-                Get-ChildItem -Path $cleanupPath -File -Filter "*.key" -Recurse | Remove-Item -Force -ErrorAction SilentlyContinue
-                Get-ChildItem -Path $cleanupPath -File -Filter "*.cer" -Recurse | Remove-Item -Force -ErrorAction SilentlyContinue
-                Get-ChildItem -Path $cleanupPath -File -Filter "*.pfx" -Recurse | Remove-Item -Force -ErrorAction SilentlyContinue
-                Get-ChildItem -Path $cleanupPath -File -Filter "pluginargs.json" -Recurse | Remove-Item -Force -ErrorAction SilentlyContinue
+                else
+                {
+                    try
+                    {
+					    Write-Output "        generating new certificate"
+                        $AcmeCert = New-AcmeCertificateWithFallback -Subject $subject -FriendlyName "$($aadapApp[$i].DisplayName) LetsEncrypt $((Get-Date).ToString("yyyy-MM-dd"))" -Plugin $AcmePlugin -PluginArgs $AcmePluginArgs -PfxPassword $CertPassword.SecretValue -Sleep $DnsSleep -Timeout $ValidationTimeout -Alias $DnsAlias
+
+					    Write-Output "        setting the certificate to AAD"
+                        $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($CertPassword.SecretValue)
+                        try {
+                            $plainPfxPassword = [Runtime.InteropServices.Marshal]::PtrToStringAuto($bstr)
+                        } finally {
+                            [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
+                        }
+                        $params = @{
+                          onPremisesPublishing = @{
+                            verifiedCustomDomainKeyCredential = @{
+                              type  = "X509CertAndPassword"
+                              value = [Convert]::ToBase64String([System.IO.File]::ReadAllBytes($AcmeCert.PfxFullChain))
+                            }
+                            verifiedCustomDomainPasswordCredential = @{
+                              value = $plainPfxPassword
+                            }
+                          }
+                        }
+                        $plainPfxPassword = $null
+                        Update-MgBetaApplication -ApplicationId $aadapApp[$i].Id -BodyParameter $params
+
+					    Write-Output "        certificate replaced"
+                        if($SaveCertificateToKeyVault)
+                        {
+                            Save-CertToKeyVault -VaultName $keyVault -SubjectName $subject[0] -PfxPath $AcmeCert.PfxFullChain -PfxPassword $CertPassword.SecretValue
+                        }
+				    } catch {
+                        Write-Output "!!! ERROR !!! Unable to set the certificate for $($onPrem.ExternalUrl)"
+                        Write-Output "        $($Error[0].Exception)"
+                        break
+                    }
+                    # Cleanup private keys so they aren't hanging about on unsecured machines
+                    Remove-AcmeSensitiveFiles -CertKeyFile $AcmeCert.KeyFile
+                }
             }
         } catch {}
     }
@@ -394,14 +483,12 @@
         $webAppCerts = Get-AzWebAppCertificate
         foreach($webApp in $webApps)
         {
-            #Write-Host $webapp.Name
             foreach($hostname in $webApp.HostNames)
             {
-                #Write-Host "`t$hostname"
                 $cert = $null
                 if($hostname.EndsWith("azurewebsites.net")){continue}
-                $cert = $webAppCerts | ?{$_.HostNames.Contains($hostname)}
-                if($cert -ne $null)
+                $cert = $webAppCerts | Where-Object { $_.HostNames.Contains($hostname) }
+                if($null -ne $cert)
                 {
                     try
                     {
@@ -411,9 +498,16 @@
                     }
                     if($luckyDay)
                     {
-                        Write-Output $webApp.Name "($($webapp.Hostnames)) will expire in" $(((Get-Date $cert.ExpirationDate).Subtract((Get-Date)).Days)-1) "days -- UPDATING"
-                        New-AzWebAppCertificate -ResourceGroupName $webapp.ResourceGroup -WebAppName $webapp.Name -HostName $hostname -SslState SniEnabled -AddBinding
-                        Remove-AzWebAppCertificate -ResourceGroupName $webapp.ResourceGroup -ThumbPrint $cert.Thumbprint
+                        Write-Output "$($webApp.Name) ($($webapp.Hostnames)) will expire in $(((Get-Date $cert.ExpirationDate).Subtract((Get-Date)).Days)-1) days -- UPDATING"
+                        if($DryRun)
+                        {
+                            Write-Output "        [DRY RUN] Would renew certificate for hostname: $hostname"
+                        }
+                        else
+                        {
+                            New-AzWebAppCertificate -ResourceGroupName $webapp.ResourceGroup -WebAppName $webapp.Name -HostName $hostname -SslState SniEnabled -AddBinding
+                            Remove-AzWebAppCertificate -ResourceGroupName $webapp.ResourceGroup -ThumbPrint $cert.Thumbprint
+                        }
                     }
                 }
             }
@@ -431,7 +525,6 @@
         {
             $certsInUse = @()
             $certsInUse += Get-AzAppGWCert -RG $gateway.ResourceGroupName -AppGWName $gateway.Name
-            $gwUpdated = $false
 
             foreach($cert in $certsInUse)
             {
@@ -452,58 +545,40 @@
                     $needsUpdating = ($luckyDay) -and ($cert.Subject -notmatch $RegExDontUpdateTheseCerts)
                 }
                 $subject = [string[]]@()
-                $subject += [string[]]($cert.Subject.Replace('CN=','').Trim().Split(',').Trim()) | ?{$_.contains(".")}
+                $subject += [string[]]($cert.Subject.Replace('CN=','').Trim().Split(',').Trim()) | Where-Object { $_.contains(".") }
                 if($needsUpdating)
                 {
                     Write-Output "Application gateway $($gateway.Name) certificate for $($subject[0]) will expire in $(($cert.NotAfter.Subtract((Get-Date)).Days)-1) days -- UPDATING" -ErrorAction SilentlyContinue
-                    try
-                    {
-	                    Write-Output "        generating new certificate"
-                        try
-					    {
-                            Remove-Variable AcmeCert, Exception -ErrorAction SilentlyContinue
-                            Write-Output "                with a direct TXT record on the A-record"
-                    	    $AcmeCert = New-PACertificate -Domain $subject -DnsPlugin $AcmePlugin -PluginArgs $AcmePluginArgs -FriendlyName "$($aadapApp[$i].DisplayName) LetsEncrypt $((Get-Date).ToString("yyyy-MM-dd"))" -PfxPassSecure $CertPassword.SecretValue -Force -Verbose -DnsSleep $DnsSleep -ValidationTimeout $ValidationTimeout
-                            if($Exception -ne $null)
-                            {
-                                Write-Error ($Exception | ConvertTo-Json)
-                                Write-Error ($AcmePluginArgs | ConvertTo-Json)
-                            }
-					    } catch {
-                            Write-Output "                with an indirect TXT record on the CNAME"
-						    $AcmeCert = New-PACertificate -Domain $subject -DnsAlias $DnsAlias -DnsPlugin $AcmePlugin -PluginArgs $AcmePluginArgs -FriendlyName "$($aadapApp[$i].DisplayName) LetsEncrypt $((Get-Date).ToString("yyyy-MM-dd"))" -PfxPassSecure $CertPassword.SecretValue -Force -Verbose -DnsSleep $DnsSleep -ValidationTimeout $ValidationTimeout
-					    }
-					    Write-Output "        setting the certificate to the App Gateway"
 
-                        Set-AzApplicationGatewaySslCertificate -Name $subject[0] -ApplicationGateway $gateway -CertificateFile $AcmeCert.PfxFullChain -Password $CertPassword.SecretValue | Out-Null
-                        Set-AzApplicationGateway -ApplicationGateway $gateway | Out-Null
-	                    Write-Output "        certificate config updated"
-                        if($SaveCertificateToKeyVault)
-                        {
-		                    Write-Output "        saving a copy of the PFX to the keyvault"
-		                    Import-AzKeyVaultCertificate -VaultName $keyVault -Name $subject[0].replace('.','-') -FilePath $AcmeCert.PfxFullChain -Password $CertPassword.SecretValue | Out-Null
-                            Write-Output "        saved $($subject[0].replace('.','-')) to $keyvault"
-                        }
-                    } catch {
-                        Write-Output "!!! ERROR !!! Unable to set the certificate for $($gateway.Name) ($($subject[0]))"
-                        Write-Output "        $($Error[0].Exception)"
-                        continue
+                    if($DryRun)
+                    {
+                        Write-Output "        [DRY RUN] Would generate and apply certificate for: $($subject -join ', ')"
                     }
-                    # Cleanup private keys so they aren't hanging about on unsecured machines
-				    $cleanupPath = $AcmeCert.KeyFile.Substring(0,$AcmeCert.KeyFile.LastIndexOf('\'))
-				    Get-ChildItem -Path $cleanupPath -File -Filter "*.bak" -Recurse | Remove-Item -Force -ErrorAction SilentlyContinue
-                    Get-ChildItem -Path $cleanupPath -File -Filter "*.csr" -Recurse | Remove-Item -Force -ErrorAction SilentlyContinue
-                    Get-ChildItem -Path $cleanupPath -File -Filter "*.key" -Recurse | Remove-Item -Force -ErrorAction SilentlyContinue
-                    Get-ChildItem -Path $cleanupPath -File -Filter "*.cer" -Recurse | Remove-Item -Force -ErrorAction SilentlyContinue
-                    Get-ChildItem -Path $cleanupPath -File -Filter "*.pfx" -Recurse | Remove-Item -Force -ErrorAction SilentlyContinue
-                    Get-ChildItem -Path $cleanupPath -File -Filter "pluginargs.json" -Recurse | Remove-Item -Force -ErrorAction SilentlyContinue
+                    else
+                    {
+                        try
+                        {
+	                        Write-Output "        generating new certificate"
+                            $AcmeCert = New-AcmeCertificateWithFallback -Subject $subject -FriendlyName "$($gateway.Name) $($subject[0]) LetsEncrypt $((Get-Date).ToString("yyyy-MM-dd"))" -Plugin $AcmePlugin -PluginArgs $AcmePluginArgs -PfxPassword $CertPassword.SecretValue -Sleep $DnsSleep -Timeout $ValidationTimeout -Alias $DnsAlias
+
+					        Write-Output "        setting the certificate to the App Gateway"
+                            Set-AzApplicationGatewaySslCertificate -Name $subject[0] -ApplicationGateway $gateway -CertificateFile $AcmeCert.PfxFullChain -Password $CertPassword.SecretValue | Out-Null
+                            Set-AzApplicationGateway -ApplicationGateway $gateway | Out-Null
+	                        Write-Output "        certificate config updated"
+
+                            if($SaveCertificateToKeyVault)
+                            {
+                                Save-CertToKeyVault -VaultName $keyVault -SubjectName $subject[0] -PfxPath $AcmeCert.PfxFullChain -PfxPassword $CertPassword.SecretValue
+                            }
+                        } catch {
+                            Write-Output "!!! ERROR !!! Unable to set the certificate for $($gateway.Name) ($($subject[0]))"
+                            Write-Output "        $($Error[0].Exception)"
+                            continue
+                        }
+                        # Cleanup private keys so they aren't hanging about on unsecured machines
+                        Remove-AcmeSensitiveFiles -CertKeyFile $AcmeCert.KeyFile
+                    }
                 }
-            }
-            if($gwUpdated)
-            {
-                Write-Output "Saving configuration changes to Application Gateway $($gateway.Name)"
-                Set-AzApplicationGateway -ApplicationGateway $gateway
-                Write-Output "$($gateway.Name) has been updated."
             }
         }
     }
@@ -512,24 +587,26 @@
 Write-Output "`n`tWork's Done`n"
 
 #region Upload changed posh-acme configuration and certificates
-    ## Create ZIP file of configuration
-    Compress-Archive -Path $workingDirectory -DestinationPath $env:TEMP\posh-acme.zip -CompressionLevel Fastest -Force
-    Set-AzStorageBlobContent -Context $storageAccount.Context -Container $storageContainer -Blob "posh-acme.zip" -BlobType Block -File $env:TEMP\posh-acme.zip -Force | Out-Null
-    Write-Output "`nPoSh-ACME configuration was backed up to the storage container 'posh-acme'`n"
+    if(-not $DryRun)
+    {
+        ## Create ZIP file of configuration
+        Compress-Archive -Path $workingDirectory -DestinationPath $env:TEMP\posh-acme.zip -CompressionLevel Fastest -Force
+        Set-AzStorageBlobContent -Context $storageAccount.Context -Container $storageContainer -Blob "posh-acme.zip" -BlobType Block -File $env:TEMP\posh-acme.zip -Force | Out-Null
+        Write-Output "`nPoSh-ACME configuration was backed up to the storage container 'posh-acme'`n"
+    }
+    else
+    {
+        Write-Output "`n[DRY RUN] Skipping posh-acme configuration upload`n"
+    }
 #endregion
 
 #region Remove temporary files, folders and WriteLock
     Remove-AzStorageBlob -Context $storageAccount.Context -Container $storageContainer -Blob "posh-acme.settings.lock" -Force
     Remove-Item -Recurse -Force $workingDirectory
-    Remove-Item -Force $env:TEMP\posh-acme.zip
+    if(Test-Path $env:TEMP\posh-acme.zip) { Remove-Item -Force $env:TEMP\posh-acme.zip }
 #endregion
 
 #region Disconnect
 	Disconnect-AzAccount -ErrorAction SilentlyContinue | Out-Null
-	Disconnect-AzureAD -ErrorAction SilentlyContinue | Out-Null
-    Disconnect-MgGraph -ErrorAction SilentlyContinue | Out-Null
-	Disconnect-AzAccount -ErrorAction SilentlyContinue | Out-Null
-	Disconnect-AzureAD -ErrorAction SilentlyContinue | Out-Null
     Disconnect-MgGraph -ErrorAction SilentlyContinue | Out-Null
 #endregion
-
