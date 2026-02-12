@@ -1,0 +1,28 @@
+# OS
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# Editors / IDEs
+.vs/
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# AI tooling
+.claude/
+
+# Secrets and certificates -- never commit these
+*.pfx
+*.key
+*.cer
+*.pem
+.env
+.env.*
+
+# Bicep build artifacts (regenerate with: az bicep build)
+EntraPrivateAccess/epa-connector-vmss.json
+
+# PowerShell logs
+*.log
