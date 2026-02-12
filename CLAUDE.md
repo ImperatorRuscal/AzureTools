@@ -26,9 +26,16 @@ Key design decisions:
 
 ### SSL-Updater
 
-Automated SSL/TLS certificate lifecycle management for Azure AD Application Proxy.
+Automated SSL/TLS certificate lifecycle management for Azure AD Application Proxy, Application Gateways, and App Service Plans. Designed to run as a scheduled Azure Automation Runbook with a system-assigned Managed Identity.
 
-- **SSL_Update_AzureADApps.ps1** — PowerShell script integrating with Posh-ACME (Let's Encrypt). Supports 14 DNS providers (Cloudflare, GoDaddy, DNSMadeEasy, etc.), Key Vault credential storage, blob-based distributed locking, and Microsoft Graph Beta APIs for App Proxy certificate deployment. Uses randomized renewal scheduling to avoid Let's Encrypt rate limits. Application Gateway and App Service Plan support are present but WIP (behind feature flags).
+- **SSL_Update_AzureADApps.ps1** — PowerShell runbook integrating with Posh-ACME (Let's Encrypt). Supports 14 DNS providers (Cloudflare, GoDaddy, DNSMadeEasy, etc.), Key Vault credential storage, blob-based distributed locking, and Microsoft Graph Beta APIs for App Proxy certificate deployment. Uses randomized renewal scheduling to avoid Let's Encrypt rate limits. Application Gateway (`-WorkOnApplicationGateways`) and App Service Plan (`-WorkOnAppServicePlans`) support via `[switch]` parameters. Includes `-DryRun` for read-only enumeration.
+
+Key design decisions:
+- All secrets come from Key Vault at runtime via parameter names (never hardcoded).
+- `Get-AzAppGWCert` is embedded as an inline helper (parses X509 certs from App Gateway listener and backend settings).
+- Helper functions `New-AcmeCertificateWithFallback`, `Remove-AcmeSensitiveFiles`, and `Save-CertToKeyVault` eliminate duplication across the App Proxy and App Gateway code paths.
+- BSTR from `SecureStringToBSTR` is properly freed with `ZeroFreeBSTR` in try/finally.
+- Posh-ACME state is persisted as a ZIP blob in Azure Storage with a blob-based lock file for concurrency control across runbooks.
 
 ## Key Architectural Patterns
 
