@@ -6,6 +6,9 @@
 //   2. Install & register EPNC     (CustomScriptExtension + epa-bootstrapper.ps1)
 //   3. Report connector health     (ApplicationHealthWindows on HTTP :8443/health)
 //
+// The deployment also ensures the UAMI exists and has the required role assignments
+// on the Key Vault (and optionally the Storage Account for script hosting).
+//
 // Secrets are never stored in tags or visible extension settings.
 // Use a .bicepparam file or JSON parameters file with Key Vault references for
 // adminPassword and domainJoinPassword.
@@ -28,7 +31,8 @@ param adminPassword string
 @description('VM size for instances')
 param vmSize string = 'Standard_B2ms'
 
-@description('Existing User Assigned Managed Identity NAME (in the same resource group)')
+// ---- Managed Identity ----
+@description('Name of the User Assigned Managed Identity (created if it does not exist, idempotent if it does)')
 param uamiName string = 'uami-entraprivateconnector'
 
 // ---- Networking ----
@@ -59,6 +63,9 @@ param domainJoinPassword string
 @description('Name of the Key Vault that holds the EPNC registration credentials')
 param keyVaultName string
 
+@description('Resource group of the Key Vault (leave empty to use the deployment resource group)')
+param keyVaultResourceGroupName string = ''
+
 @description('Key Vault secret name for the EPNC registration username')
 param registrationUserSecretName string = 'epaReg-username'
 
@@ -78,6 +85,12 @@ param scriptGitHubUrl string = 'https://raw.githubusercontent.com/ImperatorRusca
 
 @description('When scriptSource is "storageAccount": full blob URI to epa-bootstrapper.ps1')
 param scriptStorageBlobUri string = ''
+
+@description('When scriptSource is "storageAccount": storage account name (for RBAC role assignment)')
+param scriptStorageAccountName string = ''
+
+@description('Resource group of the storage account (leave empty to use the deployment resource group)')
+param scriptStorageAccountResourceGroupName string = ''
 
 // ---- Connector Group (optional) ----
 @description('Optional EPNC connector group name to assign after registration. Leave empty to use the default group.')
@@ -114,6 +127,8 @@ var connectorGroupArg = connectorGroupName != '' ? ' -ConnectorGroupName "${conn
 var commandToExecute = 'powershell -ExecutionPolicy Bypass -File .\\${scriptFileName} -KeyVaultName "${keyVaultName}" -RegistrationUserSecretName "${registrationUserSecretName}" -RegistrationPasswordSecretName "${registrationPasswordSecretName}" -HealthPort ${healthPort}${connectorGroupArg}'
 
 // Conditional CSE settings based on script source
+var useStorageAccount = scriptSource == 'storageAccount'
+
 var cseSettingsGitHub = {
   fileUris: [
     scriptGitHubUrl
@@ -137,14 +152,28 @@ var cseProtectedSettingsStorage = {
 var cseSettings          = scriptSource == 'github' ? cseSettingsGitHub : cseSettingsStorage
 var cseProtectedSettings = scriptSource == 'github' ? cseProtectedSettingsGitHub : cseProtectedSettingsStorage
 
+// Effective resource groups (empty string = same as deployment RG)
+var effectiveKvResourceGroup      = !empty(keyVaultResourceGroupName) ? keyVaultResourceGroupName : resourceGroup().name
+var effectiveStorageResourceGroup = !empty(scriptStorageAccountResourceGroupName) ? scriptStorageAccountResourceGroupName : resourceGroup().name
+
+// Well-known Azure built-in role definition IDs
+var keyVaultSecretsUserRoleId   = subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '4633458b-17de-408a-b874-0445c86b69e6')
+var storageBlobDataReaderRoleId = subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '2a2b9908-6ea1-4ae2-8e65-a410df84e7d1')
+
+
+// =====================================================================================
+// Managed Identity (create-or-update, idempotent)
+// =====================================================================================
+
+resource uami 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-31' = {
+  name: uamiName
+  location: resourceGroup().location
+}
+
 
 // =====================================================================================
 // Existing Resources
 // =====================================================================================
-
-resource uami 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-31' existing = {
-  name: uamiName
-}
 
 resource vnet 'Microsoft.Network/virtualNetworks@2023-11-01' existing = {
   scope: resourceGroup(vnetResourceGroupName)
@@ -154,6 +183,34 @@ resource vnet 'Microsoft.Network/virtualNetworks@2023-11-01' existing = {
 resource subnetRes 'Microsoft.Network/virtualNetworks/subnets@2023-11-01' existing = {
   parent: vnet
   name: subnetName
+}
+
+// =====================================================================================
+// Role Assignments (deployed via modules to support cross-resource-group scoping)
+// =====================================================================================
+
+// Grant the UAMI "Key Vault Secrets User" on the Key Vault so the bootstrapper
+// can retrieve registration credentials at runtime via Managed Identity.
+module kvRoleAssignment './modules/kv-role-assignment.bicep' = {
+  name: '${vmssName}-kv-role-assignment'
+  scope: resourceGroup(effectiveKvResourceGroup)
+  params: {
+    keyVaultName: keyVaultName
+    principalId: uami.properties.principalId
+    roleDefinitionId: keyVaultSecretsUserRoleId
+  }
+}
+
+// When using a storage account for the bootstrapper script, grant the UAMI
+// "Storage Blob Data Reader" so the CustomScriptExtension can download the script.
+module storageRoleAssignment './modules/storage-role-assignment.bicep' = if (useStorageAccount) {
+  name: '${vmssName}-storage-role-assignment'
+  scope: resourceGroup(effectiveStorageResourceGroup)
+  params: {
+    storageAccountName: scriptStorageAccountName
+    principalId: uami.properties.principalId
+    roleDefinitionId: storageBlobDataReaderRoleId
+  }
 }
 
 
@@ -333,6 +390,9 @@ resource vmss 'Microsoft.Compute/virtualMachineScaleSets@2024-07-01' = {
       }
     }
   }
+  dependsOn: [
+    kvRoleAssignment    // Ensure UAMI has KV access before instances try to read secrets
+  ]
 }
 
 
@@ -412,4 +472,5 @@ resource autoscale 'Microsoft.Insights/autoscalesettings@2022-10-01' = {
 output vmssId string = vmss.id
 output uamiResourceId string = uami.id
 output uamiClientId string = uami.properties.clientId
+output uamiPrincipalId string = uami.properties.principalId
 output subnetId string = subnetRes.id

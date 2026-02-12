@@ -11,9 +11,11 @@ using 'epa-Connector-vmss.bicep'
 //       az keyvault update --name <vault> --enabled-for-template-deployment true
 //   - The deploying principal needs 'Microsoft.KeyVault/vaults/deploy/action' permission
 //     on the Key Vault (granted by Owner or Contributor roles).
-//   - The UAMI needs 'Key Vault Secrets User' role on the Key Vault.
-//   - The UAMI needs network access + 'Storage Blob Data Reader' if using storageAccount
-//     script source.
+//   - The deployment automatically creates the UAMI (if it doesn't exist) and assigns
+//     'Key Vault Secrets User' on the Key Vault. If using storageAccount script source,
+//     it also assigns 'Storage Blob Data Reader' on the storage account.
+//   - The deploying principal needs Owner or User Access Administrator on the Key Vault
+//     resource group (to create role assignments).
 //
 // Deploy with:
 //   az deployment group create \
@@ -40,6 +42,7 @@ param domainJoinUsername = 'svc-domainjoin@corp.contoso.com'
 
 // Key Vault & Registration
 param keyVaultName = 'kv-epac-secrets'
+// param keyVaultResourceGroupName = 'rg-keyvault'  // if KV is in a different RG
 // param registrationUserSecretName = 'epaReg-username'       // default
 // param registrationPasswordSecretName = 'epaReg-password'   // default
 
@@ -50,6 +53,8 @@ param scriptSource = 'github'
 // Option B: Storage account (production/air-gapped) -- uncomment and configure:
 // param scriptSource = 'storageAccount'
 // param scriptStorageBlobUri = 'https://stbootstrap.blob.core.windows.net/scripts/epa-bootstrapper.ps1'
+// param scriptStorageAccountName = 'stbootstrap'
+// param scriptStorageAccountResourceGroupName = 'rg-bootstrap'  // if in a different RG
 
 // ---- Optional: Connector Group ----
 // param connectorGroupName = 'EPA-WestUS2'
