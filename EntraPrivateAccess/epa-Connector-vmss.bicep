@@ -224,7 +224,7 @@ resource vmss 'Microsoft.Compute/virtualMachineScaleSets@2024-07-01' = {
   sku: {
     name: vmSize
     tier: 'Standard'
-    capacity: 1
+    capacity: minInstanceCount
   }
   identity: {
     type: 'UserAssigned'
