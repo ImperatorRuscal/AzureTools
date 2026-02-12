@@ -22,6 +22,8 @@ $env:Azure_PS_Data_Collection                      = 'true'
 
 #region "Statics"
 
+    $ScriptVersion = '2.0.0'   # Bump on each meaningful change to aid log-based troubleshooting
+
     $regScript = "$env:ProgramFiles\Microsoft Entra private network connector\RegisterConnector.ps1"
     $modPath   = "$env:ProgramFiles\Microsoft Entra private network connector\Modules\"
     $modName   = 'MicrosoftEntraPrivateNetworkConnectorPSModule'
@@ -33,6 +35,7 @@ $env:Azure_PS_Data_Collection                      = 'true'
     $logDir = Join-Path $env:SystemDrive 'Scripts'
     if (-not (Test-Path $logDir)) { New-Item -Path $logDir -ItemType Directory | Out-Null }
     Start-Transcript -Path (Join-Path $logDir 'epa-bootstrapper.ps1.log') -IncludeInvocationHeader -Force
+    Write-Host "epa-bootstrapper.ps1 v$ScriptVersion"
 
 #endregion
 
@@ -42,6 +45,8 @@ $env:Azure_PS_Data_Collection                      = 'true'
         $ts = (Get-Date).ToString('s')
         Write-Host "[$ts][$level] $msg"
     }
+
+    Write-Stamp "epa-bootstrapper.ps1 v$ScriptVersion"
 
     function Invoke-WithRetry([scriptblock]$op, [int]$retries = 5, [int]$delay = 2) {
         for ($i = 1; $i -le $retries; $i++) {
