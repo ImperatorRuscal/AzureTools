@@ -215,6 +215,28 @@ The deployment will automatically grant the UAMI `Storage Blob Data Reader` on t
 
 ---
 
+## Updating Configuration After Deployment
+
+All parameter values -- including Key Vault secret references -- are **resolved and baked into the VMSS model at deployment time**. They are not re-read dynamically when new instances scale out. This means:
+
+- Changing a Key Vault secret value (e.g. rotating `domainJoin-password`) has **no effect** on the running VMSS until you redeploy.
+- Changing a plain parameter value (e.g. `vmSize` or `domainJoinOuPath`) likewise requires a redeployment.
+
+**Redeployment is non-destructive.** Simply re-run the same deployment command:
+
+```bash
+az deployment group create \
+  --resource-group <your-resource-group> \
+  --template-file epa-Connector-vmss.bicep \
+  --parameters epa-connector-vmss.bicepparam
+```
+
+Bicep/ARM deployments are idempotent. The rolling upgrade policy will gradually update existing instances to match the new model -- healthy instances continue serving while others are updated. There is no need to tear down and recreate the VMSS.
+
+> **Tip:** If you rotate the domain join or registration credentials, update the secrets in Key Vault first, then redeploy. New and updated instances will pick up the current secret values.
+
+---
+
 ## Health Monitoring and Auto-Repair
 
 Each VMSS instance runs a lightweight HTTP health listener on port 8443 (configurable). The listener checks the `WAPCSvc` Windows service (the EPNC connector service):
