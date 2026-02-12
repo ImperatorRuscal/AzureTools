@@ -22,7 +22,7 @@ $env:Azure_PS_Data_Collection                      = 'true'
 
 #region "Statics"
 
-    $ScriptVersion = '2.0.0'   # Bump on each meaningful change to aid log-based troubleshooting
+    $ScriptVersion = '2.1.0'   # Bump on each meaningful change to aid log-based troubleshooting
 
     $regScript = "$env:ProgramFiles\Microsoft Entra private network connector\RegisterConnector.ps1"
     $modPath   = "$env:ProgramFiles\Microsoft Entra private network connector\Modules\"
@@ -51,6 +51,32 @@ $env:Azure_PS_Data_Collection                      = 'true'
     function Invoke-WithRetry([scriptblock]$op, [int]$retries = 5, [int]$delay = 2) {
         for ($i = 1; $i -le $retries; $i++) {
             try { return & $op } catch { if ($i -eq $retries) { throw }; Start-Sleep -Seconds $delay }
+        }
+    }
+
+    # Retry with exponential back-off for operations affected by Azure RBAC
+    # propagation delays (up to 10 minutes). Only retries errors matching
+    # $retryablePattern; throws immediately for non-retryable failures.
+    function Invoke-WithRetryBackoff {
+        param(
+            [Parameter(Mandatory)] [scriptblock] $Op,
+            [int]    $MaxAttempts     = 10,
+            [int]    $InitialDelay    = 15,
+            [int]    $MaxDelay        = 60,
+            [string] $RetryablePattern = 'Forbidden|throttled|429|503'
+        )
+        $delay = $InitialDelay
+        for ($i = 1; $i -le $MaxAttempts; $i++) {
+            try {
+                return & $Op
+            } catch {
+                if ($i -eq $MaxAttempts) { throw }
+                if ($_.Exception.Message -notmatch $RetryablePattern) { throw }
+                $errMsg = ($_.Exception.Message -replace '[\r\n]+', ' ').Substring(0, [Math]::Min(200, $_.Exception.Message.Length))
+                Write-Stamp "Attempt $i failed ($errMsg), retrying in ${delay}s..." 'WARN'
+                Start-Sleep -Seconds $delay
+                $delay = [Math]::Min($delay * 2, $MaxDelay)
+            }
         }
     }
 
@@ -149,8 +175,8 @@ $env:Azure_PS_Data_Collection                      = 'true'
     $azCon = Connect-AzAccount -Identity -AccountId $UamiClientId -SkipContextPopulation
 
     Write-Stamp "Fetching registration credentials from Key Vault '$KeyVaultName'"
-    $regUser = Get-PlainText (Invoke-WithRetry { Get-AzKeyVaultSecret -VaultName $KeyVaultName -Name $RegistrationUserSecretName }).SecretValue
-    $regPass = (Invoke-WithRetry { Get-AzKeyVaultSecret -VaultName $KeyVaultName -Name $RegistrationPasswordSecretName }).SecretValue
+    $regUser = Get-PlainText (Invoke-WithRetryBackoff -Op { Get-AzKeyVaultSecret -VaultName $KeyVaultName -Name $RegistrationUserSecretName }).SecretValue
+    $regPass = (Invoke-WithRetryBackoff -Op { Get-AzKeyVaultSecret -VaultName $KeyVaultName -Name $RegistrationPasswordSecretName }).SecretValue
     $epaCred = New-Object System.Management.Automation.PSCredential($regUser, $regPass)
 
     $TenantId = $azCon.Context.Tenant.Id
