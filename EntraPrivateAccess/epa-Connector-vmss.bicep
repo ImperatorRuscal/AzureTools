@@ -6,8 +6,10 @@
 //   2. Install & register EPNC     (CustomScriptExtension + epa-bootstrapper.ps1)
 //   3. Report connector health     (ApplicationHealthWindows on HTTP :8443/health)
 //
-// The deployment also ensures the UAMI exists and has the required role assignments
-// on the Key Vault (and optionally the Storage Account for script hosting).
+// The deployment also ensures the UAMI exists and has Key Vault access via both
+// RBAC role assignment and classic access policy (works regardless of which
+// permission model the Key Vault uses). Optionally grants Storage Account access
+// for script hosting.
 //
 // Secrets are never stored in tags or visible extension settings.
 // Use a .bicepparam file or JSON parameters file with Key Vault references for
@@ -198,6 +200,19 @@ module kvRoleAssignment './modules/kv-role-assignment.bicep' = {
     keyVaultName: keyVaultName
     principalId: uami.properties.principalId
     roleDefinitionId: keyVaultSecretsUserRoleId
+  }
+}
+
+// Also grant a classic access policy (Secret Get) for Key Vaults that use the
+// "Vault access policy" permission model. The 'add' operation is idempotent and
+// has no effect on Key Vaults that use RBAC mode.
+module kvAccessPolicy './modules/kv-access-policy.bicep' = {
+  name: '${vmssName}-kv-access-policy'
+  scope: resourceGroup(effectiveKvResourceGroup)
+  params: {
+    keyVaultName: keyVaultName
+    principalId: uami.properties.principalId
+    tenantId: tenant().tenantId
   }
 }
 
@@ -392,6 +407,7 @@ resource vmss 'Microsoft.Compute/virtualMachineScaleSets@2024-07-01' = {
   }
   dependsOn: [
     kvRoleAssignment    // Ensure UAMI has KV access before instances try to read secrets
+    kvAccessPolicy      // Ditto for vaults using the access policy permission model
   ]
 }
 

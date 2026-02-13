@@ -6,7 +6,7 @@ Deploy a fully automated Azure VM Scale Set whose instances automatically join a
 
 This Bicep template provisions:
 
-1. **A User Assigned Managed Identity (UAMI)** -- created (or updated) automatically with the required RBAC role assignments.
+1. **A User Assigned Managed Identity (UAMI)** -- created (or updated) automatically with Key Vault access granted via both RBAC role assignment **and** classic access policy (works regardless of which permission model the Key Vault uses).
 2. **A Flexible VM Scale Set** running Windows Server 2025 (configurable) with three VM extensions chained in order:
    - **JsonADDomainExtension** -- joins each instance to your AD domain (credentials encrypted in `protectedSettings`).
    - **CustomScriptExtension** -- downloads and runs `epa-bootstrapper.ps1`, which installs the EPNC connector and registers it with your Entra tenant.
@@ -26,8 +26,9 @@ No secrets are stored in tags, visible extension settings, or deployment outputs
                      │                                                  │
                      │  ┌──────────────┐      ┌──────────────────────┐  │
                      │  │    UAMI      │─────►│  Key Vault           │  │
-                     │  │              │ RBAC │  (Secrets User)      │  │
-                     │  └──────┬───────┘      └──────────────────────┘  │
+                     │  │              │      │  (RBAC + Access       │  │
+                     │  └──────┬───────┘      │   Policy, dual mode) │  │
+                     │         │              └──────────────────────┘  │
                      │         │                                        │
                      │  ┌──────▼──────────────────────────────────────┐ │
                      │  │  VM Scale Set (Flexible)                    │ │
@@ -89,7 +90,7 @@ The identity running `az deployment group create` needs:
 | Scope                          | Role                                            | Why                                                    |
 |--------------------------------|-------------------------------------------------|--------------------------------------------------------|
 | Target resource group          | Contributor                                     | Create VMSS, UAMI, autoscale setting                   |
-| Key Vault resource group       | Owner _or_ User Access Administrator            | Create RBAC role assignment (Key Vault Secrets User)   |
+| Key Vault resource group       | Owner _or_ User Access Administrator            | Create RBAC role assignment and access policy on Key Vault |
 | Key Vault                      | Key Vault Secrets User                          | Resolve `az.getSecret()` at deployment time            |
 | Storage account resource group | Owner _or_ User Access Administrator (optional) | Only if using `storageAccount` script source           |
 
@@ -110,9 +111,14 @@ Edit `epa-connector-vmss.bicepparam`:
 ```bicep
 using 'epa-Connector-vmss.bicep'
 
-// Secrets -- replace <subscription-id>, <rg>, <vault-name> with your values
-param adminPassword      = az.getSecret('<subscription-id>', '<resource-group>', '<vault-name>', 'vmss-adminPassword')
-param domainJoinPassword = az.getSecret('<subscription-id>', '<resource-group>', '<vault-name>', 'domainJoin-password')
+// Key Vault coordinates -- fill in once, reused for secrets and params
+var kvSubscriptionId = '<subscription-id>'
+var kvResourceGroup  = '<resource-group>'
+var kvName           = '<vault-name>'
+
+// Secrets
+param adminPassword      = az.getSecret(kvSubscriptionId, kvResourceGroup, kvName, 'vmss-adminPassword')
+param domainJoinPassword = az.getSecret(kvSubscriptionId, kvResourceGroup, kvName, 'domainJoin-password')
 
 // Networking
 param vnetResourceGroupName = 'rg-networking'
@@ -124,9 +130,12 @@ param domainJoinFqdn     = 'corp.contoso.com'
 param domainJoinOuPath   = 'OU=Servers,DC=corp,DC=contoso,DC=com'
 param domainJoinUsername  = 'svc-domainjoin@corp.contoso.com'
 
-// Key Vault & Registration
-param keyVaultName = 'kv-epac-secrets'
+// Key Vault & Registration -- reuse the vars above
+param keyVaultName              = kvName
+param keyVaultResourceGroupName = kvResourceGroup
 ```
+
+> **Note:** The `var` declarations in `.bicepparam` files require **Bicep CLI 0.21.x or later**. The Key Vault coordinates are defined once and reused for both `az.getSecret()` calls and parameter values.
 
 > **Important:** The `.bicepparam` file will contain your specific environment values. Add `*.bicepparam` (but not `*.sample.bicepparam`) to your `.gitignore` if you fork this repo.
 
@@ -141,23 +150,23 @@ az deployment group create \
 
 That's it. The deployment will:
 1. Create (or update) the UAMI.
-2. Grant the UAMI `Key Vault Secrets User` on your Key Vault (best-effort -- see note below).
+2. Grant the UAMI Key Vault access via both RBAC (`Key Vault Secrets User`) **and** classic access policy (`Secret → Get`), so it works regardless of which permission model your Key Vault uses (best-effort -- see note below).
 3. Deploy the VMSS with all three extensions chained.
 4. Configure CPU-based autoscaling and automatic instance repair.
 
 Each new VM instance will automatically join the domain, install the connector, register with Entra, and start reporting health.
 
-> **Note on Key Vault permissions:** The Bicep deployment attempts to create the RBAC role assignment automatically, but this can fail silently if the deploying principal lacks `Owner` or `User Access Administrator` on the Key Vault resource group. Additionally, Azure RBAC assignments are eventually consistent and may take several minutes to propagate after deployment. The bootstrapper retries with exponential back-off to handle propagation delays, but if instances consistently fail with `Forbidden` errors on Key Vault access, verify that the UAMI has the **Secret → Get** permission on the vault. You can grant this manually:
+> **Note on Key Vault permissions:** The Bicep deployment automatically grants the UAMI access via **both** an RBAC role assignment (`Key Vault Secrets User`) **and** a classic access policy (`Secret → Get`). Whichever permission model your Key Vault uses, one of these takes effect (the other is silently ignored). However, these grants are best-effort and can fail silently if the deploying principal lacks `Owner` or `User Access Administrator` on the Key Vault resource group. Additionally, Azure RBAC assignments are eventually consistent and may take several minutes to propagate after deployment. The bootstrapper retries with exponential back-off to handle propagation delays, but if instances consistently fail with `Forbidden` errors on Key Vault access, verify that the UAMI has the **Secret → Get** permission on the vault. You can grant this manually:
 >
 > ```bash
-> # Using RBAC (recommended)
+> # Using RBAC (for Key Vaults in RBAC mode)
 > az role assignment create \
 >   --assignee-object-id <UAMI-principal-id> \
 >   --assignee-principal-type ServicePrincipal \
 >   --role "Key Vault Secrets User" \
 >   --scope /subscriptions/<sub>/resourceGroups/<rg>/providers/Microsoft.KeyVault/vaults/<vault-name>
 >
-> # Or using access policies (legacy)
+> # Using access policies (for Key Vaults in Vault access policy mode)
 > az keyvault set-policy --name <vault-name> \
 >   --object-id <UAMI-principal-id> \
 >   --secret-permissions get
@@ -344,7 +353,7 @@ To assign connectors to a specific group, either:
 ## Security Design
 
 - **No secrets in tags or visible settings.** Domain join password, admin password, and registration credentials are all handled via `protectedSettings` (encrypted at rest and in transit) or Key Vault references in the `.bicepparam` file.
-- **UAMI + RBAC, not access policies.** The deployment grants exactly the permissions needed -- `Key Vault Secrets User` on the vault, and optionally `Storage Blob Data Reader` on the storage account.
+- **UAMI + dual Key Vault access model.** The deployment grants the UAMI access via both RBAC (`Key Vault Secrets User`) and classic access policy (`Secret → Get`), so it works regardless of which permission model the Key Vault uses. Optionally grants `Storage Blob Data Reader` on the storage account for script hosting.
 - **Installer signature verification.** The bootstrapper validates the EPNC installer's Authenticode signature and confirms it was signed by Microsoft Corporation before executing.
 - **TLS 1.2 + strong cryptography.** The bootstrapper enables TLS 1.2 and sets `SchUseStrongCrypto` registry keys for both 32-bit and 64-bit .NET Framework paths.
 - **Fully non-interactive.** The bootstrapper installs Az modules by downloading `.nupkg` files directly from PSGallery, bypassing NuGet provider bootstrapping, PowerShellGet, and repository trust prompts that can hang in headless contexts. All Az telemetry/survey prompts, progress bars, and confirmation prompts are suppressed. The connector installer has a 10-minute timeout to prevent indefinite hangs.
@@ -360,6 +369,7 @@ EntraPrivateAccess/
 ├── epa-bootstrapper.ps1                    # PowerShell bootstrap script (runs on each VM)
 ├── epa-connector-vmss.sample.bicepparam    # Sample parameters file (copy and customize)
 ├── modules/
+│   ├── kv-access-policy.bicep             # Classic access policy module for Key Vault
 │   ├── kv-role-assignment.bicep            # RBAC module for Key Vault
 │   └── storage-role-assignment.bicep       # RBAC module for Storage Account
 └── README.md                               # This file
