@@ -26,7 +26,7 @@ No secrets are stored in tags, visible extension settings, or deployment outputs
                      │                                                  │
                      │  ┌──────────────┐      ┌──────────────────────┐  │
                      │  │    UAMI      │─────►│  Key Vault           │  │
-                     │  │              │      │  (RBAC + Access       │  │
+                     │  │              │      │  (RBAC + Access      │  │
                      │  └──────┬───────┘      │   Policy, dual mode) │  │
                      │         │              └──────────────────────┘  │
                      │         │                                        │
