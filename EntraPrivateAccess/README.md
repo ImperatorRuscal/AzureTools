@@ -8,9 +8,9 @@ This Bicep template provisions:
 
 1. **A User Assigned Managed Identity (UAMI)** -- created (or updated) automatically with Key Vault access granted via both RBAC role assignment **and** classic access policy (works regardless of which permission model the Key Vault uses).
 2. **A Flexible VM Scale Set** running Windows Server 2025 (configurable) with three VM extensions chained in order:
-   - **JsonADDomainExtension** -- joins each instance to your AD domain (credentials encrypted in `protectedSettings`).
-   - **CustomScriptExtension** -- downloads and runs `epa-bootstrapper.ps1`, which installs the EPNC connector and registers it with your Entra tenant.
-   - **ApplicationHealthWindows** -- probes an HTTP endpoint on each instance that checks the actual `WAPCSvc` Windows service.
+   - **JsonADDomainExtension** (v1.3) -- joins each instance to your AD domain (credentials encrypted in `protectedSettings`).
+   - **CustomScriptExtension** (v1.10) -- downloads and runs `epa-bootstrapper.ps1`, which installs the EPNC connector and registers it with your Entra tenant.
+   - **ApplicationHealthWindows** (v2.0, Rich Health States) -- probes an HTTP endpoint on each instance that checks the actual `WAPCSvc` Windows service.
 3. **CPU-based autoscaling** (scale out at >70%, scale in at <=50%).
 4. **Automatic instance repair** -- unhealthy VMs (WAPCSvc not running) are replaced after a 30-minute grace period.
 
@@ -156,7 +156,7 @@ That's it. The deployment will:
 
 Each new VM instance will automatically join the domain, install the connector, register with Entra, and start reporting health.
 
-> **Note on Key Vault permissions:** The Bicep deployment automatically grants the UAMI access via **both** an RBAC role assignment (`Key Vault Secrets User`) **and** a classic access policy (`Secret → Get`). Whichever permission model your Key Vault uses, one of these takes effect (the other is silently ignored). However, these grants are best-effort and can fail silently if the deploying principal lacks `Owner` or `User Access Administrator` on the Key Vault resource group. Additionally, Azure RBAC assignments are eventually consistent and may take several minutes to propagate after deployment. The bootstrapper retries with exponential back-off to handle propagation delays, but if instances consistently fail with `Forbidden` errors on Key Vault access, verify that the UAMI has the **Secret → Get** permission on the vault. You can grant this manually:
+> **Note on Key Vault permissions:** The Bicep deployment automatically grants the UAMI access via **both** an RBAC role assignment (`Key Vault Secrets User`) **and** a classic access policy (`Secret → Get`). Whichever permission model your Key Vault uses, one of these takes effect (the other is silently ignored). However, these grants are best-effort and can fail silently if the deploying principal lacks `Owner` or `User Access Administrator` on the Key Vault resource group. Additionally, Azure RBAC assignments are eventually consistent and may take several minutes to propagate after deployment. The bootstrapper retries with exponential back-off (15 s initial delay, doubling up to 60 s, 10 attempts — covering roughly 8 minutes) to handle propagation delays, but if instances consistently fail with `Forbidden` errors on Key Vault access, verify that the UAMI has the **Secret → Get** permission on the vault. You can grant this manually:
 >
 > ```bash
 > # Using RBAC (for Key Vaults in RBAC mode)
@@ -313,7 +313,7 @@ RDP or Bastion into an instance and check:
 C:\Scripts\epa-bootstrapper.ps1.log
 ```
 
-This transcript contains timestamped output from every step of the bootstrap process.
+This transcript contains timestamped output from every step of the bootstrap process. The script version (e.g. `v2.2.0`) is logged near the top of the transcript — check this first to confirm which edition of the bootstrapper ran.
 
 ### Common Issues
 
@@ -368,10 +368,10 @@ EntraPrivateAccess/
 ├── epa-Connector-vmss.bicep               # Main Bicep template
 ├── epa-bootstrapper.ps1                    # PowerShell bootstrap script (runs on each VM)
 ├── epa-connector-vmss.sample.bicepparam    # Sample parameters file (copy and customize)
-├── modules/
-│   ├── kv-access-policy.bicep             # Classic access policy module for Key Vault
-│   ├── kv-role-assignment.bicep            # RBAC module for Key Vault
-│   └── storage-role-assignment.bicep       # RBAC module for Storage Account
+├── modules/                                  # Separate modules enable scoped deployments
+│   ├── kv-access-policy.bicep             #   to resources in different resource groups
+│   ├── kv-role-assignment.bicep            #   (e.g. KV or storage account in another RG)
+│   └── storage-role-assignment.bicep       #
 └── README.md                               # This file
 ```
 
