@@ -107,6 +107,9 @@ param minInstanceCount int = 2
 @minValue(1)
 param maxInstanceCount int = 10
 
+@description('Windows time zone for the autoscale maintenance schedule (e.g. "Eastern Standard Time", "UTC")')
+param autoscaleTimeZone string = 'Central Standard Time'
+
 // ---- Health ----
 @description('Port for the health HTTP listener on each instance')
 param healthPort int = 8443
@@ -157,6 +160,17 @@ var cseProtectedSettings = scriptSource == 'github' ? cseProtectedSettingsGitHub
 // Effective resource groups (empty string = same as deployment RG)
 var effectiveKvResourceGroup      = !empty(keyVaultResourceGroupName) ? keyVaultResourceGroupName : resourceGroup().name
 var effectiveStorageResourceGroup = !empty(scriptStorageAccountResourceGroupName) ? scriptStorageAccountResourceGroupName : resourceGroup().name
+
+// Days of the week for recurring autoscale schedules
+var everyDay = [
+  'Monday'
+  'Tuesday'
+  'Wednesday'
+  'Thursday'
+  'Friday'
+  'Saturday'
+  'Sunday'
+]
 
 // Well-known Azure built-in role definition IDs
 var keyVaultSecretsUserRoleId   = subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '4633458b-17de-408a-b874-0445c86b69e6')
@@ -413,8 +427,97 @@ resource vmss 'Microsoft.Compute/virtualMachineScaleSets@2024-07-01' = {
 
 
 // =====================================================================================
-// Autoscale (CPU-based)
+// Autoscale (CPU + Memory metric-based, with daily maintenance window)
 // =====================================================================================
+
+// Metric rules shared by the default and post-maintenance profiles.
+// Defined as a variable to avoid duplicating rules across both profiles.
+var autoscaleMetricRules = [
+  // Scale OUT: average CPU > 70% for 10 minutes
+  {
+    metricTrigger: {
+      metricName: 'Percentage CPU'
+      metricNamespace: 'Microsoft.Compute/virtualMachineScaleSets'
+      metricResourceUri: vmss.id
+      timeGrain: 'PT1M'
+      statistic: 'Average'
+      timeWindow: 'PT10M'
+      timeAggregation: 'Average'
+      operator: 'GreaterThan'
+      threshold: 70
+      dividePerInstance: false
+    }
+    scaleAction: {
+      direction: 'Increase'
+      type: 'ChangeCount'
+      value: '1'
+      cooldown: 'PT5M'
+    }
+  }
+  // Scale IN: average CPU <= 50% for 10 minutes
+  {
+    metricTrigger: {
+      metricName: 'Percentage CPU'
+      metricNamespace: 'Microsoft.Compute/virtualMachineScaleSets'
+      metricResourceUri: vmss.id
+      timeGrain: 'PT1M'
+      statistic: 'Average'
+      timeWindow: 'PT10M'
+      timeAggregation: 'Average'
+      operator: 'LessThanOrEqual'
+      threshold: 50
+      dividePerInstance: false
+    }
+    scaleAction: {
+      direction: 'Decrease'
+      type: 'ChangeCount'
+      value: '1'
+      cooldown: 'PT5M'
+    }
+  }
+  // Scale OUT: average available memory < 20% for 10 minutes
+  {
+    metricTrigger: {
+      metricName: 'Available Memory Percentage'
+      metricNamespace: 'Microsoft.Compute/virtualMachineScaleSets'
+      metricResourceUri: vmss.id
+      timeGrain: 'PT1M'
+      statistic: 'Average'
+      timeWindow: 'PT10M'
+      timeAggregation: 'Average'
+      operator: 'LessThan'
+      threshold: 20
+      dividePerInstance: false
+    }
+    scaleAction: {
+      direction: 'Increase'
+      type: 'ChangeCount'
+      value: '1'
+      cooldown: 'PT5M'
+    }
+  }
+  // Scale IN: average available memory > 60% for 10 minutes
+  {
+    metricTrigger: {
+      metricName: 'Available Memory Percentage'
+      metricNamespace: 'Microsoft.Compute/virtualMachineScaleSets'
+      metricResourceUri: vmss.id
+      timeGrain: 'PT1M'
+      statistic: 'Average'
+      timeWindow: 'PT10M'
+      timeAggregation: 'Average'
+      operator: 'GreaterThan'
+      threshold: 60
+      dividePerInstance: false
+    }
+    scaleAction: {
+      direction: 'Decrease'
+      type: 'ChangeCount'
+      value: '1'
+      cooldown: 'PT5M'
+    }
+  }
+]
 
 resource autoscale 'Microsoft.Insights/autoscalesettings@2022-10-01' = {
   name: '${vmssName}-autoscale'
@@ -424,57 +527,53 @@ resource autoscale 'Microsoft.Insights/autoscalesettings@2022-10-01' = {
     enabled: true
     targetResourceUri: vmss.id
     profiles: [
+      // Default profile: metric-based scaling (fallback when no recurring schedule matches)
       {
-        name: 'cpu-based'
+        name: 'default-scaling'
         capacity: {
           minimum: '${minInstanceCount}'
           maximum: '${maxInstanceCount}'
+          default: '${minInstanceCount}'
+        }
+        rules: autoscaleMetricRules
+      }
+      // Maintenance window: fixed at exactly 2 instances daily 04:00–04:30
+      {
+        name: 'maintenance-window'
+        capacity: {
+          minimum: '2'
+          maximum: '2'
           default: '2'
         }
-        rules: [
-          // Scale OUT: average CPU > 70% for 10 minutes
-          {
-            metricTrigger: {
-              metricName: 'Percentage CPU'
-              metricNamespace: 'Microsoft.Compute/virtualMachineScaleSets'
-              metricResourceUri: vmss.id
-              timeGrain: 'PT1M'
-              statistic: 'Average'
-              timeWindow: 'PT10M'
-              timeAggregation: 'Average'
-              operator: 'GreaterThan'
-              threshold: 70
-              dividePerInstance: false
-            }
-            scaleAction: {
-              direction: 'Increase'
-              type: 'ChangeCount'
-              value: '1'
-              cooldown: 'PT5M'
-            }
+        rules: []
+        recurrence: {
+          frequency: 'Week'
+          schedule: {
+            timeZone: autoscaleTimeZone
+            days: everyDay
+            hours: [4]
+            minutes: [0]
           }
-          // Scale IN: average CPU <= 50% for 10 minutes
-          {
-            metricTrigger: {
-              metricName: 'Percentage CPU'
-              metricNamespace: 'Microsoft.Compute/virtualMachineScaleSets'
-              metricResourceUri: vmss.id
-              timeGrain: 'PT1M'
-              statistic: 'Average'
-              timeWindow: 'PT10M'
-              timeAggregation: 'Average'
-              operator: 'LessThanOrEqual'
-              threshold: 50
-              dividePerInstance: false
-            }
-            scaleAction: {
-              direction: 'Decrease'
-              type: 'ChangeCount'
-              value: '1'
-              cooldown: 'PT5M'
-            }
+        }
+      }
+      // Post-maintenance: resume metric-based scaling daily at 04:30
+      {
+        name: 'post-maintenance'
+        capacity: {
+          minimum: '${minInstanceCount}'
+          maximum: '${maxInstanceCount}'
+          default: '${minInstanceCount}'
+        }
+        rules: autoscaleMetricRules
+        recurrence: {
+          frequency: 'Week'
+          schedule: {
+            timeZone: autoscaleTimeZone
+            days: everyDay
+            hours: [4]
+            minutes: [30]
           }
-        ]
+        }
       }
     ]
   }

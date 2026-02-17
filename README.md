@@ -6,7 +6,7 @@ A collection of infrastructure-as-code templates and automation scripts for mana
 
 ### [EntraPrivateAccess](EntraPrivateAccess/)
 
-Bicep template that deploys a fully automated VM Scale Set whose instances join an AD domain, install and register the **Microsoft Entra Private Network Connector (EPNC)**, and report health -- all hands-off after initial deployment. Includes CPU-based autoscaling and automatic instance repair for unhealthy connectors.
+Bicep template that deploys a fully automated VM Scale Set whose instances join an AD domain, install and register the **Microsoft Entra Private Network Connector (EPNC)**, and report health -- all hands-off after initial deployment. Includes CPU + memory autoscaling with a daily maintenance window and automatic instance repair for unhealthy connectors.
 
 - **IaC:** Bicep (Azure Resource Manager)
 - **Runtime:** PowerShell bootstrap script on Windows Server

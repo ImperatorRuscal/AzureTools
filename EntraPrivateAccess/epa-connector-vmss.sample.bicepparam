@@ -73,4 +73,5 @@ param scriptSource = 'github'
 // param uamiName = 'uami-entraprivateconnector'
 // param minInstanceCount = 2
 // param maxInstanceCount = 10
+// param autoscaleTimeZone = 'UTC'   // Windows time zone for the 04:00–04:30 maintenance window
 // param healthPort = 8443

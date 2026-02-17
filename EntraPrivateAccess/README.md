@@ -11,7 +11,7 @@ This Bicep template provisions:
    - **JsonADDomainExtension** (v1.3) -- joins each instance to your AD domain (credentials encrypted in `protectedSettings`).
    - **CustomScriptExtension** (v1.10) -- downloads and runs `epa-bootstrapper.ps1`, which installs the EPNC connector and registers it with your Entra tenant.
    - **ApplicationHealthWindows** (v2.0, Rich Health States) -- probes an HTTP endpoint on each instance that checks the actual `WAPCSvc` Windows service.
-3. **CPU-based autoscaling** (scale out at >70%, scale in at <=50%).
+3. **CPU + memory autoscaling** with a daily maintenance window (scale out on high CPU or low memory, scale in when idle, fixed instance count during a nightly 30-minute window).
 4. **Automatic instance repair** -- unhealthy VMs (WAPCSvc not running) are replaced after a 30-minute grace period.
 
 No secrets are stored in tags, visible extension settings, or deployment outputs.
@@ -43,7 +43,7 @@ No secrets are stored in tags, visible extension settings, or deployment outputs
                      │  │   Extension 3: appHealth                    │ │
                      │  │       └─► HTTP GET :8443/health             │ │
                      │  │                                             │ │
-                     │  │   Autoscale  ──► CPU-based rules            │ │
+                     │  │   Autoscale  ──► CPU + Memory rules          │ │
                      │  │   Auto-repair ──► Replace unhealthy VMs     │ │
                      │  └─────────────────────────────────────────────┘ │
                      └──────────────────────────────────────────────────┘
@@ -152,7 +152,7 @@ That's it. The deployment will:
 1. Create (or update) the UAMI.
 2. Grant the UAMI Key Vault access via both RBAC (`Key Vault Secrets User`) **and** classic access policy (`Secret → Get`), so it works regardless of which permission model your Key Vault uses (best-effort -- see note below).
 3. Deploy the VMSS with all three extensions chained.
-4. Configure CPU-based autoscaling and automatic instance repair.
+4. Configure CPU + memory autoscaling (with a daily maintenance window) and automatic instance repair.
 
 Each new VM instance will automatically join the domain, install the connector, register with Entra, and start reporting health.
 
@@ -238,6 +238,7 @@ The deployment will automatically grant the UAMI `Storage Blob Data Reader` on t
 | `connectorGroupName`               | string | `''`                                      | Connector group to assign (see note below)                        |
 | `minInstanceCount`                 | int    | `2`                                       | Autoscale minimum instances (2+ for high availability)            |
 | `maxInstanceCount`                 | int    | `10`                                      | Autoscale maximum instances                                       |
+| `autoscaleTimeZone`                | string | `UTC`                                     | Windows time zone for the maintenance window (e.g. `Eastern Standard Time`) |
 | `healthPort`                       | int    | `8443`                                    | Port for the health HTTP listener                                 |
 
 ---
@@ -285,14 +286,22 @@ Invoke-RestMethod http://localhost:8443/health
 
 ## Autoscaling
 
-The deployment creates a CPU-based autoscale profile:
+The deployment creates three autoscale profiles:
 
-| Condition                        | Action           | Cooldown |
-|----------------------------------|------------------|----------|
-| Average CPU > 70% for 10 min    | Add 1 instance   | 5 min    |
-| Average CPU <= 50% for 10 min   | Remove 1 instance| 5 min    |
+### Default / Post-Maintenance -- Metric-Based Scaling
 
-Scale-in uses the `OldestVM` policy. New instances go through the full extension chain automatically.
+| Condition                                  | Action            | Cooldown |
+|--------------------------------------------|-------------------|----------|
+| Average CPU > 70% for 10 min              | Add 1 instance    | 5 min    |
+| Average CPU ≤ 50% for 10 min              | Remove 1 instance | 5 min    |
+| Average Available Memory < 20% for 10 min | Add 1 instance    | 5 min    |
+| Average Available Memory > 60% for 10 min | Remove 1 instance | 5 min    |
+
+Either CPU or memory pressure can independently trigger a scale-out. Scale-in uses the `OldestVM` policy. New instances go through the full extension chain automatically.
+
+### Maintenance Window -- Fixed Capacity
+
+A recurring schedule profile sets the VMSS to exactly **2 instances** daily from **04:00 to 04:30** (time zone controlled by the `autoscaleTimeZone` parameter, default UTC). During this window metric rules are suspended -- the instance count is fixed. At 04:30 the post-maintenance profile resumes metric-based scaling.
 
 ---
 
