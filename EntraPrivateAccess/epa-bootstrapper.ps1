@@ -22,7 +22,7 @@ $env:Azure_PS_Data_Collection                      = 'true'
 
 #region "Statics"
 
-    $ScriptVersion = '2.2.0'   # Bump on each meaningful change to aid log-based troubleshooting
+    $ScriptVersion = '2.2.1'   # Bump on each meaningful change to aid log-based troubleshooting
 
     $regScript = "$env:ProgramFiles\Microsoft Entra private network connector\RegisterConnector.ps1"
     $modPath   = "$env:ProgramFiles\Microsoft Entra private network connector\Modules\"
@@ -88,6 +88,17 @@ $env:Azure_PS_Data_Collection                      = 'true'
         finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($ptr) }
     }
 
+    # Trim a version string down to just the leading [version]-castable portion.
+    # PSGallery sometimes publishes GA modules with SemVer pre-release tags
+    # (e.g. Az.Accounts 5.4.1-preview); the suffix breaks [version] casts.
+    function ConvertTo-SafeVersion {
+        param([string] $VersionString)
+        if ([string]::IsNullOrWhiteSpace($VersionString)) { return [version]'0.0.0.0' }
+        $m = [regex]::Match($VersionString, '^\d+(\.\d+){0,3}')
+        if (-not $m.Success) { throw "Cannot parse version from '$VersionString'" }
+        return [version]$m.Value
+    }
+
     # Enable TLS 1.2 for all .NET HTTP clients in this session
     [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
     Write-Stamp 'TLS 1.2 enabled'
@@ -115,7 +126,8 @@ $env:Azure_PS_Data_Collection                      = 'true'
         )
 
         # Skip if already available
-        if (Get-Module -ListAvailable -Name $Name | Where-Object { $_.Version -ge [version]$MinimumVersion }) {
+        $minVer = ConvertTo-SafeVersion $MinimumVersion
+        if (Get-Module -ListAvailable -Name $Name | Where-Object { $_.Version -ge $minVer }) {
             Write-Stamp "Module $Name already installed (>= $MinimumVersion)"
             return
         }
@@ -130,7 +142,7 @@ $env:Azure_PS_Data_Collection                      = 'true'
         $packageUrl = $entry.content.src
         $version    = $entry.properties.Version
 
-        if ([version]$version -lt [version]$MinimumVersion) {
+        if ((ConvertTo-SafeVersion $version) -lt $minVer) {
             throw "Latest $Name version ($version) is below required minimum ($MinimumVersion)"
         }
 
@@ -138,7 +150,10 @@ $env:Azure_PS_Data_Collection                      = 'true'
         $nupkgPath = Join-Path ([IO.Path]::GetTempPath()) "$Name.$version.nupkg"
         Invoke-WithRetry { Invoke-WebRequest -Uri $packageUrl -OutFile $nupkgPath -UseBasicParsing -TimeoutSec 60 }
 
-        $installDir = Join-Path "$env:ProgramFiles\WindowsPowerShell\Modules" "$Name\$version"
+        # Folder name must parse as [version] for Get-Module -ListAvailable to find it,
+        # so strip any SemVer pre-release suffix from $version when building the path.
+        $installVersion = (ConvertTo-SafeVersion $version).ToString()
+        $installDir = Join-Path "$env:ProgramFiles\WindowsPowerShell\Modules" "$Name\$installVersion"
         New-Item -ItemType Directory -Force -Path $installDir | Out-Null
 
         Write-Stamp "Extracting $Name to $installDir"
