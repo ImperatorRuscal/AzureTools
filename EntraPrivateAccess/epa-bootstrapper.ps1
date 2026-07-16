@@ -22,7 +22,7 @@ $env:Azure_PS_Data_Collection                      = 'true'
 
 #region "Statics"
 
-    $ScriptVersion = '2.2.1'   # Bump on each meaningful change to aid log-based troubleshooting
+    $ScriptVersion = '2.2.2'   # Bump on each meaningful change to aid log-based troubleshooting
 
     $regScript = "$env:ProgramFiles\Microsoft Entra private network connector\RegisterConnector.ps1"
     $modPath   = "$env:ProgramFiles\Microsoft Entra private network connector\Modules\"
@@ -114,6 +114,18 @@ $env:Azure_PS_Data_Collection                      = 'true'
         }
     }
     Write-Stamp 'Strong crypto registry keys set'
+
+    # Enable certificate padding check (Authenticode/WinVerifyTrust hardening, MS13-098 / CVE-2013-3900).
+    # Unlike the .NetFramework keys above, WinTrust\Config is not guaranteed to exist, so create it if missing.
+    $certPaddingPaths = @(
+        'HKLM:\SOFTWARE\Wow6432Node\Microsoft\Cryptography\WinTrust\Config'
+        'HKLM:\SOFTWARE\Microsoft\Cryptography\WinTrust\Config'
+    )
+    foreach ($p in $certPaddingPaths) {
+        if (-not (Test-Path $p)) { New-Item -Path $p -Force | Out-Null }
+        Set-ItemProperty -Path $p -Name 'EnableCertPaddingCheck' -Value '1' -Type String
+    }
+    Write-Stamp 'Cert padding check registry keys set'
 
     # Install a module by downloading its .nupkg directly from PSGallery.
     # This bypasses NuGet provider, PackageManagement, PowerShellGet, and
