@@ -31,7 +31,7 @@ param adminUsername string = 'azAdministrator'
 param adminPassword string
 
 @description('VM size for instances')
-param vmSize string = 'Standard_B2ms'
+param vmSize string = 'Standard_B2s_v2'
 
 // ---- Managed Identity ----
 @description('Name of the User Assigned Managed Identity (created if it does not exist, idempotent if it does)')
