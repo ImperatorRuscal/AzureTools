@@ -22,7 +22,7 @@ $env:Azure_PS_Data_Collection                      = 'true'
 
 #region "Statics"
 
-    $ScriptVersion = '2.2.2'   # Bump on each meaningful change to aid log-based troubleshooting
+    $ScriptVersion = '2.3.0'   # Bump on each meaningful change to aid log-based troubleshooting
 
     $regScript = "$env:ProgramFiles\Microsoft Entra private network connector\RegisterConnector.ps1"
     $modPath   = "$env:ProgramFiles\Microsoft Entra private network connector\Modules\"
@@ -34,7 +34,11 @@ $env:Azure_PS_Data_Collection                      = 'true'
 
     $logDir = Join-Path $env:SystemDrive 'Scripts'
     if (-not (Test-Path $logDir)) { New-Item -Path $logDir -ItemType Directory | Out-Null }
-    Start-Transcript -Path (Join-Path $logDir 'epa-bootstrapper.ps1.log') -IncludeInvocationHeader -Force
+    # This folder holds scripts that run as SYSTEM (resume task, health listener), so restrict
+    # it to SYSTEM + Administrators -- the default C:\ ACL lets Users create files in subfolders.
+    icacls.exe $logDir /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' | Out-Null
+    # -Append: the bootstrap may run twice (CSE, then the resume-on-boot task); keep both runs' output
+    Start-Transcript -Path (Join-Path $logDir 'epa-bootstrapper.ps1.log') -IncludeInvocationHeader -Append
     Write-Host "epa-bootstrapper.ps1 v$ScriptVersion"
 
 #endregion
@@ -47,6 +51,47 @@ $env:Azure_PS_Data_Collection                      = 'true'
     }
 
     Write-Stamp "epa-bootstrapper.ps1 v$ScriptVersion"
+
+#endregion
+
+#region "Survive the domain-join reboot"
+
+    # JsonADDomainExtension (Restart = true) reports success and *then* reboots the VM, so
+    # CustomScriptExtension can start this script while Windows is already shutting down and
+    # get killed partway through (observed: restart initiated 14:39:07, bootstrapper started
+    # 14:39:23, killed 14:39:28 with "The pipeline has been stopped").
+    #
+    # Defense: before doing any real work, register a startup task that re-runs this script
+    # with the same arguments. It is only removed after a successful bootstrap, so a run killed
+    # by *any* reboot resumes on next boot. Uses schtasks.exe (not the ScheduledTasks module)
+    # because it registers in milliseconds -- we may be racing a shutdown here.
+    $resumeTaskName = 'EPA-BootstrapResume'
+    $resumeScript   = Join-Path $logDir 'epa-bootstrapper.ps1'
+    $resumeCmd      = Join-Path $logDir 'epa-bootstrap-resume.cmd'
+
+    if ($PSCommandPath -ne $resumeScript) {
+        Copy-Item -LiteralPath $PSCommandPath -Destination $resumeScript -Force
+    }
+    $resumeArgs = ($PSBoundParameters.GetEnumerator() | ForEach-Object { "-$($_.Key) `"$($_.Value)`"" }) -join ' '
+    # schtasks /TR is capped at 261 chars, so the full command line lives in a wrapper .cmd
+    Set-Content -Path $resumeCmd -Encoding Ascii -Value "@`"$env:WINDIR\System32\WindowsPowerShell\v1.0\powershell.exe`" -NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$resumeScript`" $resumeArgs"
+    # /DELAY gives networking (IMDS, Key Vault, PSGallery) a minute to come up after boot
+    schtasks.exe /Create /F /TN $resumeTaskName /RU SYSTEM /RL HIGHEST /SC ONSTART /DELAY 0001:00 /TR "`"$resumeCmd`"" | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "Failed to register '$resumeTaskName' startup task (schtasks exit code $LASTEXITCODE)" }
+    Write-Stamp "Resume-on-boot task '$resumeTaskName' registered"
+
+    # Netlogon\JoinDomain exists from a successful domain join until the next reboot.
+    # If it's there, the domain-join restart is imminent (or already underway): exit cleanly
+    # so CustomScriptExtension reports success, and let the startup task do the work.
+    if (Test-Path 'HKLM:\SYSTEM\CurrentControlSet\Services\Netlogon\JoinDomain') {
+        Write-Stamp 'Domain-join reboot is pending -- deferring bootstrap to the startup task'
+        Stop-Transcript -ErrorAction SilentlyContinue | Out-Null
+        exit 0
+    }
+
+#endregion
+
+#region "More Helper Functions"
 
     function Invoke-WithRetry([scriptblock]$op, [int]$retries = 5, [int]$delay = 2) {
         for ($i = 1; $i -le $retries; $i++) {
@@ -347,8 +392,10 @@ while (`$listener.IsListening) {
                         -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$healthScriptPath`""
         $trigger   = New-ScheduledTaskTrigger -AtStartup
         $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+        # -ExecutionTimeLimit 0 = no limit. The default is 72h, after which Task Scheduler kills
+        # the listener and the instance goes Unhealthy even though the connector is fine.
         $settings  = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
-                        -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
+                        -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) -ExecutionTimeLimit ([TimeSpan]::Zero)
         Register-ScheduledTask -TaskName $healthTaskName -TaskPath '\' -Action $action -Trigger $trigger -Principal $principal -Settings $settings
         Write-Stamp "Health listener scheduled task registered"
     }
@@ -366,6 +413,13 @@ while (`$listener.IsListening) {
 #endregion
 
 #region "Cleanup"
+
+    # Success -- the resume-on-boot safety net is no longer needed
+    if (Get-ScheduledTask -TaskName $resumeTaskName -TaskPath '\' -ErrorAction SilentlyContinue) {
+        Unregister-ScheduledTask -TaskName $resumeTaskName -TaskPath '\' -Confirm:$false
+    }
+    Remove-Item -LiteralPath $resumeCmd, $resumeScript -Force -ErrorAction SilentlyContinue
+    Write-Stamp "Resume-on-boot task removed"
 
     Write-Stamp "Bootstrap complete."
     Disconnect-AzAccount -Scope Process -ErrorAction SilentlyContinue
