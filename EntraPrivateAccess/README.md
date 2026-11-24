@@ -37,6 +37,7 @@ No secrets are stored in tags, visible extension settings, or deployment outputs
                      │  │       └─► AD domain join (auto-reboot)      │ │
                      │  │   Extension 2: customScript                 │ │
                      │  │       └─► epa-bootstrapper.ps1              │ │
+                     │  │           ├─ Defer past domain-join reboot  │ │
                      │  │           ├─ Install EPNC connector         │ │
                      │  │           ├─ Register with Entra tenant     │ │
                      │  │           └─ Start health HTTP listener     │ │
@@ -82,6 +83,18 @@ az keyvault update --name <your-vault> --enabled-for-template-deployment true
 ### 3. Networking
 
 - An existing **Virtual Network** and **subnet** that has connectivity to your AD domain controllers and outbound internet access (for downloading the EPNC installer and reaching Microsoft services).
+- Outbound **TCP 443** from the subnet to the endpoints below. If egress passes through an NSG, Azure Firewall, or NVA, allow these explicitly. Prefer service tags or FQDN rules over IPs -- the addresses behind these names rotate.
+
+  | Endpoint | Service tag | Used for |
+  |----------|-------------|----------|
+  | `login.microsoftonline.com`, `login.windows.net`, `login.live.com` | `AzureActiveDirectory` | Connector registration (`AcquireToken`) and runtime token refresh |
+  | `*.msappproxy.net` | -- | Installer download and connector traffic |
+  | `*.servicebus.windows.net` | `ServiceBus` | Connector control channel |
+  | `www.powershellgallery.com` | -- | Az.Accounts / Az.KeyVault download |
+  | `<vault>.vault.azure.net` | `AzureKeyVault` | Registration credentials |
+  | `crl*.digicert.com`, `ocsp.digicert.com`, `crl.microsoft.com`, `www.microsoft.com` | -- | Certificate revocation checks (**TCP 80**) |
+
+  Managed identity tokens come from IMDS (`169.254.169.254`), which never leaves the host -- so a blocked `AzureActiveDirectory` path is not noticed until connector registration. See [Microsoft's connector network requirements](https://learn.microsoft.com/entra/global-secure-access/how-to-configure-connectors#network-requirements) for the authoritative list.
 
 ### 4. Deploying Principal Permissions
 
@@ -314,15 +327,28 @@ In the Azure portal, navigate to the VMSS instance > **Extensions + applications
 2. `customScript`
 3. `appHealth`
 
+### How the Bootstrap Survives the Domain-Join Reboot
+
+`joinDomain` (with `Restart: true`) reports success and *then* reboots the VM, so `customScript` can start while Windows is already shutting down. To make that harmless, the bootstrapper (v2.3.0+):
+
+1. Immediately registers an `EPA-BootstrapResume` startup task that re-runs it with the same arguments (1-minute delay after boot).
+2. If a domain-join reboot is pending, exits `0` right away -- `customScript` reports success and the startup task does the real work after the reboot.
+3. Removes the startup task only after a fully successful bootstrap.
+
+A bootstrap that fails or is interrupted for any reason therefore retries on every boot until it succeeds -- after fixing an underlying problem (e.g. network), just restart the instance. Because the real work happens after `customScript` has already reported success, **the bootstrap log -- not the extension status -- is the source of truth**.
+
 ### View the Bootstrap Log
 
-RDP or Bastion into an instance and check:
+The transcript is at `C:\Scripts\epa-bootstrapper.ps1.log` (appended across runs, so a normal first boot shows two runs: the deferral, then the full bootstrap). `C:\Scripts` is restricted to SYSTEM and Administrators. Read it without RDP using Run Command:
 
-```
-C:\Scripts\epa-bootstrapper.ps1.log
+```powershell
+$vm = az vmss list-instances -g <rg> -n <vmss> --query "[0].name" -o tsv
+az vm run-command invoke -g <rg> -n $vm --command-id RunPowerShellScript `
+  --scripts "Get-Content C:\Scripts\epa-bootstrapper.ps1.log -Tail 60" `
+  --query "value[0].message" -o tsv
 ```
 
-This transcript contains timestamped output from every step of the bootstrap process. The script version (e.g. `v2.2.0`) is logged near the top of the transcript — check this first to confirm which edition of the bootstrapper ran.
+The script version (e.g. `v2.3.0`) is logged at the top of each run -- check this first to confirm which edition of the bootstrapper ran. A successful run ends with `Resume-on-boot task removed` and `Bootstrap complete.`
 
 ### Common Issues
 
@@ -331,7 +357,11 @@ This transcript contains timestamped output from every step of the bootstrap pro
 | `joinDomain` fails | Domain controller unreachable, wrong credentials, or OU path doesn't exist | Verify subnet routing to DC, check `domainJoinUsername`/`domainJoinPassword`, verify OU path in AD |
 | `customScript` fails | Script download failed, or Key Vault access denied | Check `scriptSource` config; verify UAMI has `Key Vault Secrets User` on the vault |
 | `customScript` hangs at "Setting up PS Gallery" | DNS not yet working after domain join, or outbound internet blocked | Verify the subnet has outbound HTTPS access to `www.powershellgallery.com` and Azure IMDS; check NSG rules and DNS forwarder configuration |
-| `appHealth` reports unhealthy | `WAPCSvc` service not running | Check the bootstrap log for registration errors; verify registration credentials are valid |
+| Bootstrap log ends with `TerminatingError(): "The pipeline has been stopped."` (bootstrapper < v2.3.0) | Domain-join reboot killed the script mid-run; `customScript` shows *"may have been interrupted by a VM restart"* | Use bootstrapper v2.3.0+ and replace the instance |
+| Registration fails: `AcquireToken : ... "Request to the endpoint timed out."` | Outbound 443 to Entra ID (`AzureActiveDirectory` service tag) is dropped by an NSG, firewall/NVA, or route | Allow the endpoints in [Networking](#3-networking); diagnose with `az network watcher test-ip-flow` / `show-next-hop` to `login.microsoftonline.com`'s IP, then restart the instance |
+| `appHealth` reports unhealthy | `WAPCSvc` service not running, or the health listener isn't running | Check the bootstrap log for registration errors; verify registration credentials are valid; run `Invoke-RestMethod http://localhost:8443/health` on the instance (connection refused = listener down) |
+| Instance goes unhealthy ~3 days after deploy (bootstrapper < v2.3.0) | `EPA-HealthListener` task hit Task Scheduler's default 72h execution limit | Use bootstrapper v2.3.0+ (no execution limit) and replace the instance |
+| `appHealth` stuck at `Transitioning`; auto-repair never acts | Health listener never started (bootstrap didn't finish), so the instance likely never reports a definitive *Unhealthy* state for automatic repair to act on | Fix the bootstrap failure (see log), then restart or replace the instance |
 | Connector not visible in Entra admin center | Registration failed | Check bootstrap log for errors in the "Register the EPNC connector" section |
 | Auto-repair keeps replacing instances | Connector repeatedly failing to start | Investigate root cause in bootstrap log before it's replaced; consider increasing `gracePeriod` |
 
