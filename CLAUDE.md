@@ -19,7 +19,8 @@ Automates deployment of Microsoft Entra Private Network Connectors on Azure VM S
 - **epa-bootstrapper.ps1** — PowerShell script run by the CustomScriptExtension after domain join. Installs the EPNC connector, registers it with Entra via credentials from Key Vault, and starts a persistent HTTP health listener. All config comes via command-line parameters (no IMDS tag reading).
 
 Key design decisions:
-- Domain join handled by Azure's `JsonADDomainExtension`, not PowerShell (eliminates reboot-and-resume fragility).
+- Domain join handled by Azure's `JsonADDomainExtension`, not PowerShell. That extension reports success *before* its reboot, so the bootstrapper first registers an `EPA-BootstrapResume` ONSTART task (via `schtasks.exe` -- fast, since it may be racing a shutdown), exits 0 if `Netlogon\JoinDomain` shows a pending reboot, and removes the task only after a successful run. Keep this guard first in the script.
+- The bootstrap log `C:\Scripts\epa-bootstrapper.ps1.log` (appended across runs), not the `customScript` status, is the source of truth for bootstrap success.
 - No secrets in VMSS tags or visible extension settings. `commandToExecute` is in `protectedSettings`.
 - Automatic instance repair replaces unhealthy VMs (WAPCSvc not running for 30 min).
 - Connector group assignment is a TODO (requires Graph Beta API + UAMI permissions).
