@@ -20,34 +20,25 @@ No secrets are stored in tags, visible extension settings, or deployment outputs
 
 ## Architecture
 
-```
-                     ┌──────────────────────────────────────────────────┐
-                     │  Azure Resource Group                            │
-                     │                                                  │
-                     │  ┌──────────────┐      ┌──────────────────────┐  │
-                     │  │    UAMI      │─────►│  Key Vault           │  │
-                     │  │              │      │  (RBAC + Access      │  │
-                     │  └──────┬───────┘      │   Policy, dual mode) │  │
-                     │         │              └──────────────────────┘  │
-                     │         │                                        │
-                     │  ┌──────▼──────────────────────────────────────┐ │
-                     │  │  VM Scale Set (Flexible)                    │ │
-                     │  │                                             │ │
-                     │  │   Extension 1: joinDomain                   │ │
-                     │  │       └─► AD domain join (auto-reboot)      │ │
-                     │  │   Extension 2: customScript                 │ │
-                     │  │       └─► epa-bootstrapper.ps1              │ │
-                     │  │           ├─ Defer past domain-join reboot  │ │
-                     │  │           ├─ Install EPNC connector         │ │
-                     │  │           ├─ Register with Entra tenant     │ │
-                     │  │           └─ Start health HTTP listener     │ │
-                     │  │   Extension 3: appHealth                    │ │
-                     │  │       └─► HTTP GET :8443/health             │ │
-                     │  │                                             │ │
-                     │  │   Autoscale  ──► CPU + Memory rules          │ │
-                     │  │   Auto-repair ──► Replace unhealthy VMs     │ │
-                     │  └─────────────────────────────────────────────┘ │
-                     └──────────────────────────────────────────────────┘
+```mermaid
+flowchart TB
+    subgraph RG["Azure Resource Group"]
+        UAMI["UAMI"]
+        KV["Key Vault<br/>RBAC + Access Policy (dual mode)"]
+
+        subgraph VMSS["VM Scale Set (Flexible)"]
+            E1["<b>Extension 1: joinDomain</b><br/>AD domain join (auto-reboot)"]
+            E2["<b>Extension 2: customScript</b><br/>epa-bootstrapper.ps1<br/>• Defer past domain-join reboot<br/>• Install EPNC connector<br/>• Register with Entra tenant<br/>• Start health HTTP listener"]
+            E3["<b>Extension 3: appHealth</b><br/>HTTP GET :8443/health"]
+            AS["Autoscale<br/>CPU + Memory rules"]
+            AR["Auto-repair<br/>Replace unhealthy VMs"]
+
+            E1 --> E2 --> E3
+        end
+
+        UAMI --> KV
+        UAMI --> VMSS
+    end
 ```
 
 ---
